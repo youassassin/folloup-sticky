@@ -123,6 +123,86 @@ Followup currently treats `ready` as:
 
 - `configured == true`
 - `authenticated == true`
+- Wi-Fi station connected (as last reported through `SetNetworkState`)
+
+Authentication is kept across a Wi-Fi drop, so `ready` returns on reconnect
+without re-validating the key. A change in `ready` caused by connectivity fires
+a Gemini event.
+
+### Request serialization
+
+Every Gemini HTTPS exchange (authentication, `GenerateText`, and the
+three-session `Transcribe`) runs under one internal mutex. Each exchange opens
+its own TLS session, which costs tens of KB of internal RAM, so overlapping
+transcription, summary, and auth work is not allowed. A call can therefore block
+while another finishes. The lock order is network mutex first, state mutex
+second.
+
+### Key rejection
+
+If a request made after a successful authentication returns HTTP 401 or 403,
+`gemini_service` clears the authenticated state (so `ready` goes false), records
+the error, and starts re-authentication. A rejection is ignored if the key
+changed while the request was in flight.
+
+### Retry and backoff
+
+Authentication, `GenerateText`, and each step of `Transcribe` retry transient
+failures: connection-level `transport_error`, and HTTP 408, 429, 500, 502, 503,
+504. There are at most 3 attempts per operation, with a 1 s then 2 s backoff
+plus 0-499 ms of random jitter. Retries are skipped when Wi-Fi is down, and
+other statuses (400, 401, 403, 404, ...) and `response_too_large` are never
+retried. Backoff sleeps while holding the network lock, so it delays other
+Gemini work by a few seconds at most.
+
+For transcription, the audio upload (start + finalize) is retried as a unit on a
+fresh connection, because a failed resumable upload is not resumed. The
+`generateContent` step is retried on its own, so a failure there does not
+re-send the audio.
+
+### Connection reuse during transcription
+
+The three transcription requests (start upload, send audio, `generateContent`)
+share one TLS connection through `HttpSession`. This was written against the
+ESP-IDF v5.4 `esp_http_client` source:
+
+- Every request on the session uses `esp_http_client_open` / `write` /
+  `fetch_headers` / `read`, never `esp_http_client_perform`. After the manual
+  flow the client is left in its "reading response" state, where `perform()`
+  would not send a new request but `open()` does.
+- The client's event handler is the only thing that collects the response body
+  (and the `x-goog-upload-url` header). It fires in the manual flow too, so the
+  read loop only drains the socket; appending from both would duplicate data.
+- Request headers are cleared before each request so none leak across.
+- ESP-IDF has no keep-alive query. If a reused connection turns out to be stale,
+  the session closes it and replays that one request on a fresh connection; the
+  replay does not count as a retry.
+
+### Uploaded audio cleanup
+
+`Transcribe` uploads the clip through the Files API and returns the file's
+resource name in `TranscriptionResult::uploaded_file_name` (only if it matches
+the expected `files/<id>` shape, since it is spliced into a URL). After
+`transcription_service` has published the result, it calls
+`gemini_service::DeleteUploadedFile(...)` to remove the file. The delete runs
+after the result so it adds nothing to the user-visible wait, goes through the
+same network lock as every other exchange, and is best effort: failures are
+logged and ignored because uploads expire on Google's side anyway.
+
+### Response and output limits
+
+Response bodies are capped while they are read: 16 KB for auth and the upload
+start/finalize calls, 64 KB for `generateContent`. A reply past the cap fails
+the request with `response_too_large` instead of growing the heap.
+
+Requests also send `generationConfig.maxOutputTokens`: 512 for transcription
+and 2048 for text/summary generation. If the model stops at that ceiling, the
+service logs a warning and still returns the (possibly cut-off) text.
+
+### Token budgeting
+
+`summary_service` estimates prompt size locally (about 4 characters per token)
+to decide whether to trim or chunk. There is no `countTokens` call.
 
 ## Transport Details
 
@@ -349,7 +429,6 @@ Not yet ported:
 
 - transcription jobs
 - summary generation
-- token counting
 - archived audio upload
 - provider worker queue shared across multiple Gemini job types
 - frontend portal UI for Gemini settings

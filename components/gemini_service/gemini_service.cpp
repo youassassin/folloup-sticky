@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -17,6 +18,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "followup_task_config.h"
 #include "freertos/FreeRTOS.h"
@@ -52,6 +54,18 @@ constexpr const char* kTranscriptPrompt =
 constexpr int kTranscribeTimeoutMs = 30000;
 constexpr size_t kHttpUploadChunkSamples = 2048;
 
+// Response body caps. Bodies are accumulated in a std::string, so an unexpectedly large reply
+// (proxy error page, runaway generation) would otherwise grow the heap without bound. Past the
+// cap the rest of the body is dropped and the request fails with "response_too_large".
+constexpr size_t kDefaultMaxResponseBytes = 16 * 1024;   // auth, upload start/finalize
+constexpr size_t kGenerateMaxResponseBytes = 64 * 1024;  // generateContent (text + metadata)
+
+// Output token ceilings sent as generationConfig.maxOutputTokens. A recording is at most 10 s of
+// speech (tens of tokens), so 512 is generous headroom. Summaries are asked to be concise; 2048
+// leaves room for a multi-day rollup without cutting off mid-sentence in normal use.
+constexpr int kTranscriptMaxOutputTokens = 512;
+constexpr int kTextMaxOutputTokens = 2048;
+
 struct AuthResult {
     bool success = false;
     int http_status = 0;
@@ -67,7 +81,38 @@ struct HttpResponse {
     std::string error_code;
     std::string error_message;
     std::string upload_url;  // captured from the x-goog-upload-url header (resumable upload)
+    size_t max_body_bytes = kDefaultMaxResponseBytes;
+    bool body_truncated = false;  // set once the body hit max_body_bytes and was cut off
 };
+
+// Append `length` bytes to the response body, honoring the cap. Returns false once the cap has
+// been hit (the excess is discarded and body_truncated is set).
+bool AppendResponseBody(HttpResponse* response, const char* data, size_t length)
+{
+    if (response->body_truncated) {
+        return false;
+    }
+    const size_t room = response->max_body_bytes > response->body.size()
+                            ? response->max_body_bytes - response->body.size()
+                            : 0;
+    if (length > room) {
+        response->body.append(data, room);
+        response->body_truncated = true;
+        return false;
+    }
+    response->body.append(data, length);
+    return true;
+}
+
+// Turn a truncated body into an explicit transport-level failure so callers don't try to parse
+// half a JSON document. Safe to call unconditionally after a request completes.
+void MarkIfTruncated(HttpResponse* response)
+{
+    if (response->body_truncated && response->error_code.empty()) {
+        response->error_code = "response_too_large";
+        response->error_message = "Gemini response exceeded the size limit";
+    }
+}
 
 struct AuthTaskContext {
     std::string api_key;
@@ -76,6 +121,11 @@ struct AuthTaskContext {
 };
 
 std::mutex s_mutex;
+// Serializes every Gemini HTTPS exchange (auth, generateContent, transcription). Each exchange
+// opens its own TLS session, and a session costs tens of KB of internal RAM, so letting
+// transcription, summary and auth overlap can exhaust the internal heap. Lock order: take this
+// first, then s_mutex; never take this while holding s_mutex.
+std::mutex s_network_mutex;
 EventHandler s_event_handler = nullptr;
 void* s_event_context = nullptr;
 bool s_initialized = false;
@@ -262,7 +312,10 @@ Snapshot BuildSnapshotLocked()
     snapshot.settings.model_name = kDefaultModelName;
 
     snapshot.runtime.initialized = s_initialized;
-    snapshot.runtime.ready = configured && s_authenticated;
+    // Ready means "a request can be issued right now": the key has authenticated and Wi-Fi is
+    // up. Authentication is kept across a Wi-Fi drop, so ready returns on reconnect without
+    // re-validating the key.
+    snapshot.runtime.ready = configured && s_authenticated && s_network_connected;
     snapshot.runtime.request_in_flight = s_request_in_flight;
     snapshot.runtime.auth_checked = s_auth_checked;
     snapshot.runtime.authenticated = s_authenticated;
@@ -313,8 +366,8 @@ esp_err_t HttpEventHandler(esp_http_client_event_t* event)
         response != nullptr &&
         event->data != nullptr &&
         event->data_len > 0) {
-        response->body.append(static_cast<const char*>(event->data),
-                              static_cast<size_t>(event->data_len));
+        (void)AppendResponseBody(response, static_cast<const char*>(event->data),
+                                 static_cast<size_t>(event->data_len));
     } else if (event->event_id == HTTP_EVENT_ON_HEADER && response != nullptr &&
                event->header_key != nullptr && event->header_value != nullptr &&
                strcasecmp(event->header_key, "x-goog-upload-url") == 0) {
@@ -365,6 +418,62 @@ void PopulateHttpError(cJSON* root, const HttpResponse& response,
     *error_message = TrimForLog(std::move(*error_message));
 }
 
+// --- retry policy -----------------------------------------------------------
+//
+// Transient failures (a dropped or timed-out connection, or an HTTP status Google documents as
+// retryable) get a bounded number of retries with exponential backoff plus jitter. Retries run
+// while holding s_network_mutex, so a long backoff delays other Gemini work by at most a few
+// seconds; that is deliberate, since firing a competing request into the same trouble would not
+// help either of them.
+constexpr int kMaxRequestAttempts = 3;        // the first try plus two retries
+constexpr uint32_t kRetryBaseDelayMs = 1000;  // doubles each retry: 1 s, then 2 s
+constexpr uint32_t kRetryJitterMs = 500;      // plus a random 0..499 ms so retries don't align
+
+bool IsNetworkConnected()
+{
+    std::lock_guard<std::mutex> lock(s_mutex);
+    return s_network_connected;
+}
+
+bool IsRetryableFailure(const HttpResponse& response)
+{
+    if (!response.error_code.empty()) {
+        // Only connection-level failures. A too-large body or a client that failed to
+        // initialize will not get better by asking again.
+        return response.error_code == "transport_error";
+    }
+    switch (response.status_code) {
+        case 408:  // request timeout
+        case 429:  // rate limited / quota
+        case 500:
+        case 502:
+        case 503:
+        case 504:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Sleep before the next attempt. `failed_attempt` is the 1-based number of the attempt that just
+// failed. Returns false (and does not sleep) when Wi-Fi is gone, since retrying offline only
+// burns the socket timeout again.
+bool WaitBeforeRetry(const char* what, int failed_attempt, const HttpResponse& response)
+{
+    if (!IsNetworkConnected()) {
+        ESP_LOGW(kTag, "Gemini %s failed and Wi-Fi is down; not retrying", what);
+        return false;
+    }
+    const uint32_t delay_ms = (kRetryBaseDelayMs << (failed_attempt - 1)) +
+                              (esp_random() % kRetryJitterMs);
+    ESP_LOGW(kTag, "Gemini %s failed (attempt %d/%d, http=%d code=%s); retrying in %u ms", what,
+             failed_attempt, kMaxRequestAttempts, response.status_code,
+             response.error_code.empty() ? "<none>" : response.error_code.c_str(),
+             static_cast<unsigned>(delay_ms));
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    return IsNetworkConnected();
+}
+
 HttpResponse PerformGeminiModelGet(const std::string& api_key,
                                    const std::string& model_name)
 {
@@ -399,13 +508,22 @@ HttpResponse PerformGeminiModelGet(const std::string& api_key,
         response.error_code = "transport_error";
         response.error_message = esp_err_to_name(err);
     }
+    MarkIfTruncated(&response);
     return response;
 }
 
 AuthResult Authenticate(const std::string& api_key, const std::string& model_name)
 {
     AuthResult result = {};
-    const HttpResponse http = PerformGeminiModelGet(api_key, model_name);
+    std::lock_guard<std::mutex> network_lock(s_network_mutex);
+    HttpResponse http = {};
+    for (int attempt = 1;; ++attempt) {
+        http = PerformGeminiModelGet(api_key, model_name);
+        if (!IsRetryableFailure(http) || attempt >= kMaxRequestAttempts ||
+            !WaitBeforeRetry("authentication", attempt, http)) {
+            break;
+        }
+    }
     result.http_status = http.status_code;
 
     if (!http.error_code.empty()) {
@@ -517,6 +635,39 @@ void MaybeBeginAuthentication()
     if (should_start) {
         (void)BeginAuthentication();
     }
+}
+
+uint32_t CurrentAuthGeneration()
+{
+    std::lock_guard<std::mutex> lock(s_mutex);
+    return s_auth_generation;
+}
+
+// A 401/403 on a request made after a successful authentication means the key was revoked or
+// lost access. Drop the authenticated state so `ready` goes false and dependents stop issuing
+// requests, then re-validate through the normal auth path (a bad key fails there too, and a
+// transient rejection recovers). `generation` is the auth generation captured when the request
+// started; if the key changed while it was in flight, the rejection is about the old key and is
+// ignored.
+void NoteRequestStatus(uint32_t generation, int http_status, const std::string& error_code,
+                       const std::string& error_message)
+{
+    if (http_status != 401 && http_status != 403) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        if (generation != s_auth_generation || !s_authenticated) {
+            return;
+        }
+        s_authenticated = false;
+        s_last_http_status = http_status;
+        s_last_status_message = "Gemini rejected the API key";
+        SetLastErrorLocked(error_code.c_str(), error_message.c_str());
+    }
+    ESP_LOGW(kTag, "Gemini request rejected (http=%d); clearing authenticated state", http_status);
+    Notify();
+    MaybeBeginAuthentication();
 }
 
 std::string ReadRequestBody(httpd_req_t* request)
@@ -736,11 +887,12 @@ esp_err_t HandlePortalRuntimeGet(httpd_req_t* request)
     return SendJsonResponse(request, 200, root);
 }
 
-// Synchronous JSON POST to a Gemini endpoint (generateContent / countTokens).
+// Synchronous JSON POST to a Gemini endpoint (generateContent).
 HttpResponse PerformGeminiPost(const std::string& url, const std::string& api_key,
                                const std::string& body)
 {
     HttpResponse response = {};
+    response.max_body_bytes = kGenerateMaxResponseBytes;
 
     esp_http_client_config_t config = {};
     config.url = url.c_str();
@@ -771,12 +923,28 @@ HttpResponse PerformGeminiPost(const std::string& url, const std::string& api_ke
         response.error_code = "transport_error";
         response.error_message = esp_err_to_name(err);
     }
+    MarkIfTruncated(&response);
+    return response;
+}
+
+// PerformGeminiPost with the retry policy applied. Each attempt uses a fresh connection.
+HttpResponse PerformGeminiPostWithRetry(const char* what, const std::string& url,
+                                        const std::string& api_key, const std::string& body)
+{
+    HttpResponse response = {};
+    for (int attempt = 1;; ++attempt) {
+        response = PerformGeminiPost(url, api_key, body);
+        if (!IsRetryableFailure(response) || attempt >= kMaxRequestAttempts ||
+            !WaitBeforeRetry(what, attempt, response)) {
+            break;
+        }
+    }
     return response;
 }
 
 // A single text-part prompt: {"contents":[{"parts":[{"text": prompt}]}]}. temperature=0 keeps
-// summaries deterministic; countTokens ignores generationConfig, so it is harmless there.
-std::string BuildTextRequestBody(const std::string& prompt, bool include_generation_config)
+// summaries deterministic.
+std::string BuildTextRequestBody(const std::string& prompt)
 {
     cJSON* root = cJSON_CreateObject();
     cJSON* contents = cJSON_AddArrayToObject(root, "contents");
@@ -786,10 +954,9 @@ std::string BuildTextRequestBody(const std::string& prompt, bool include_generat
     cJSON* prompt_part = cJSON_CreateObject();
     cJSON_AddStringToObject(prompt_part, "text", prompt.c_str());
     cJSON_AddItemToArray(parts, prompt_part);
-    if (include_generation_config) {
-        cJSON* generation_config = cJSON_AddObjectToObject(root, "generationConfig");
-        cJSON_AddNumberToObject(generation_config, "temperature", 0);
-    }
+    cJSON* generation_config = cJSON_AddObjectToObject(root, "generationConfig");
+    cJSON_AddNumberToObject(generation_config, "temperature", 0);
+    cJSON_AddNumberToObject(generation_config, "maxOutputTokens", kTextMaxOutputTokens);
 
     char* raw = cJSON_PrintUnformatted(root);
     std::string body = raw != nullptr ? raw : "";
@@ -830,6 +997,24 @@ std::string ExtractCandidateText(cJSON* root)
         text += part_text;
     }
     return text;
+}
+
+// True when candidates[0].finishReason is "MAX_TOKENS", i.e. the output hit maxOutputTokens and
+// the text is cut off.
+bool CandidateHitTokenLimit(cJSON* root)
+{
+    if (root == nullptr) {
+        return false;
+    }
+    cJSON* candidates = cJSON_GetObjectItemCaseSensitive(root, "candidates");
+    if (!cJSON_IsArray(candidates)) {
+        return false;
+    }
+    cJSON* candidate = cJSON_GetArrayItem(candidates, 0);
+    if (!cJSON_IsObject(candidate)) {
+        return false;
+    }
+    return JsonStringField(candidate, "finishReason") == "MAX_TOKENS";
 }
 
 std::string JsonNestedStringField(cJSON* root, const char* first, const char* second)
@@ -902,146 +1087,246 @@ std::array<uint8_t, 44> BuildWavHeaderPcm16Mono(size_t sample_count, uint32_t sa
     return header;
 }
 
-bool ReadHttpResponseBody(esp_http_client_handle_t client, HttpResponse* response)
-{
-    if (client == nullptr || response == nullptr) {
-        return false;
+// Request headers an HttpSession exchange may set. All of them are cleared before each request so
+// one request's headers never leak into the next on the shared connection (the upload "finalize"
+// must not inherit the "start" request's Content-Type or API-key header, and generateContent must
+// not inherit any X-Goog-Upload-* header).
+constexpr const char* kSessionHeaderKeys[] = {
+    "x-goog-api-key",
+    "Accept",
+    "Content-Type",
+    "X-Goog-Upload-Protocol",
+    "X-Goog-Upload-Command",
+    "X-Goog-Upload-Header-Content-Length",
+    "X-Goog-Upload-Header-Content-Type",
+    "X-Goog-Upload-Offset",
+};
+
+struct SessionHeader {
+    const char* key;
+    const char* value;
+};
+
+// One TLS connection reused across the several requests of a transcription (start the upload,
+// send the audio, generateContent). All three target generativelanguage.googleapis.com, so after
+// the first handshake the rest ride the same connection; if the host differed, set_url would drop
+// and re-establish it on its own.
+//
+// Every request goes through esp_http_client_open/write/fetch_headers/read rather than
+// esp_http_client_perform. After the manual flow the client sits in its "reading response" state,
+// where perform() would not send a new request but open() always does, so using one flow for
+// every request keeps them interchangeable on one handle. The event handler still fires ON_DATA
+// and ON_HEADER in the manual flow, so it is the only thing that collects the body (and the
+// x-goog-upload-url header); the read loop below just drains the socket. Appending from both
+// would duplicate the body.
+//
+// ESP-IDF exposes no keep-alive check, so a connection the server closed while idle shows up as a
+// failed first attempt on a reused connection. Exchange() handles that by closing the connection
+// and replaying the request once on a fresh one; that replay is not counted as a retry.
+class HttpSession {
+public:
+    using BodyWriter = std::function<bool(esp_http_client_handle_t)>;
+
+    HttpSession()
+    {
+        esp_http_client_config_t config = {};
+        config.url = kGeminiApiBaseUrl;
+        config.method = HTTP_METHOD_POST;
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        config.timeout_ms = kTranscribeTimeoutMs;
+        config.event_handler = &HttpEventHandler;
+        config.user_data = &response_;
+        client_ = esp_http_client_init(&config);
     }
-    std::array<char, 512> buffer = {};
-    while (true) {
-        const int read = esp_http_client_read(client, buffer.data(), buffer.size());
-        if (read < 0) {
-            response->error_code = "transport_error";
-            response->error_message = "Failed reading HTTP response body";
-            return false;
+
+    ~HttpSession()
+    {
+        if (client_ != nullptr) {
+            esp_http_client_cleanup(client_);
         }
-        if (read == 0) {
-            break;
-        }
-        response->body.append(buffer.data(), static_cast<size_t>(read));
     }
-    return true;
-}
 
-HttpResponse PerformUploadStart(const std::string& api_key, size_t num_bytes)
-{
-    HttpResponse response = {};
+    HttpSession(const HttpSession&) = delete;
+    HttpSession& operator=(const HttpSession&) = delete;
 
-    esp_http_client_config_t config = {};
-    config.url = kUploadUrl;
-    config.method = HTTP_METHOD_POST;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.timeout_ms = kTranscribeTimeoutMs;
-    config.event_handler = &HttpEventHandler;
-    config.user_data = &response;
+    bool valid() const { return client_ != nullptr; }
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == nullptr) {
-        response.error_code = "http_client_init_failed";
-        response.error_message = "Failed to initialize Gemini upload client";
+    // POST `body_len` bytes (produced by `write_body`) to `url` and return the response.
+    HttpResponse Exchange(const std::string& url, int timeout_ms, size_t max_body_bytes,
+                          std::initializer_list<SessionHeader> headers, size_t body_len,
+                          const BodyWriter& write_body)
+    {
+        const bool reused = exchanges_ > 0;
+        ++exchanges_;
+        HttpResponse response =
+            ExchangeOnce(url, timeout_ms, max_body_bytes, headers, body_len, write_body);
+        if (reused && response.error_code == "transport_error" && response.status_code <= 0 &&
+            response.body.empty()) {
+            ESP_LOGW(kTag, "Gemini connection looks stale; reconnecting and replaying request");
+            if (client_ != nullptr) {
+                esp_http_client_close(client_);
+            }
+            response = ExchangeOnce(url, timeout_ms, max_body_bytes, headers, body_len, write_body);
+        }
         return response;
     }
 
+private:
+    HttpResponse Fail(const char* message)
+    {
+        response_.error_code = "transport_error";
+        response_.error_message = message;
+        // Drop the connection so the next exchange starts from a clean one.
+        esp_http_client_close(client_);
+        return std::move(response_);
+    }
+
+    HttpResponse ExchangeOnce(const std::string& url, int timeout_ms, size_t max_body_bytes,
+                              std::initializer_list<SessionHeader> headers, size_t body_len,
+                              const BodyWriter& write_body)
+    {
+        response_ = HttpResponse{};
+        response_.max_body_bytes = max_body_bytes;
+        if (client_ == nullptr) {
+            response_.error_code = "http_client_init_failed";
+            response_.error_message = "Failed to initialize Gemini HTTP client";
+            return std::move(response_);
+        }
+
+        for (const char* key : kSessionHeaderKeys) {
+            (void)esp_http_client_delete_header(client_, key);
+        }
+        if (esp_http_client_set_url(client_, url.c_str()) != ESP_OK) {
+            return Fail("Invalid Gemini request URL");
+        }
+        esp_http_client_set_method(client_, HTTP_METHOD_POST);
+        esp_http_client_set_timeout_ms(client_, timeout_ms);
+        esp_http_client_set_header(client_, "User-Agent", "folloup-sticky");
+        for (const SessionHeader& header : headers) {
+            esp_http_client_set_header(client_, header.key, header.value);
+        }
+
+        const esp_err_t open_err = esp_http_client_open(client_, static_cast<int>(body_len));
+        if (open_err != ESP_OK) {
+            response_.error_code = "transport_error";
+            response_.error_message = esp_err_to_name(open_err);
+            esp_http_client_close(client_);
+            return std::move(response_);
+        }
+        if (write_body && !write_body(client_)) {
+            return Fail("Failed sending Gemini request body");
+        }
+
+        const int64_t header_length = esp_http_client_fetch_headers(client_);
+        response_.status_code = esp_http_client_get_status_code(client_);
+        if (response_.status_code <= 0 && header_length < 0) {
+            return Fail("Failed fetching Gemini response headers");
+        }
+
+        // Drain the body. The event handler has already appended it (up to the cap), so the
+        // bytes read here are discarded.
+        std::array<char, 512> scratch = {};
+        while (true) {
+            const int read = esp_http_client_read(client_, scratch.data(), scratch.size());
+            if (read < 0) {
+                return Fail("Failed reading HTTP response body");
+            }
+            if (read == 0) {
+                break;
+            }
+            if (response_.body_truncated) {
+                // Cap hit: abandon the rest of the body, which also means abandoning the
+                // connection since the unread bytes would corrupt the next response.
+                esp_http_client_close(client_);
+                break;
+            }
+        }
+        MarkIfTruncated(&response_);
+        return std::move(response_);
+    }
+
+    esp_http_client_handle_t client_ = nullptr;
+    HttpResponse response_ = {};
+    int exchanges_ = 0;
+};
+
+// Start a resumable upload; the response carries the upload URL in x-goog-upload-url.
+HttpResponse SessionUploadStart(HttpSession& session, const std::string& api_key,
+                                size_t num_bytes)
+{
     char content_length[32] = {};
     std::snprintf(content_length, sizeof(content_length), "%u", static_cast<unsigned>(num_bytes));
     static constexpr const char* metadata = "{\"file\":{\"display_name\":\"STICKY_NOTE\"}}";
-    esp_http_client_set_header(client, "x-goog-api-key", api_key.c_str());
-    esp_http_client_set_header(client, "X-Goog-Upload-Protocol", "resumable");
-    esp_http_client_set_header(client, "X-Goog-Upload-Command", "start");
-    esp_http_client_set_header(client, "X-Goog-Upload-Header-Content-Length", content_length);
-    esp_http_client_set_header(client, "X-Goog-Upload-Header-Content-Type", kAudioMimeType);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, metadata, std::strlen(metadata));
-
-    const esp_err_t err = esp_http_client_perform(client);
-    response.status_code = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-    if (err != ESP_OK) {
-        response.error_code = "transport_error";
-        response.error_message = esp_err_to_name(err);
-    }
-    return response;
+    const size_t metadata_len = std::strlen(metadata);
+    return session.Exchange(
+        kUploadUrl, kTranscribeTimeoutMs, kDefaultMaxResponseBytes,
+        {
+            {"x-goog-api-key", api_key.c_str()},
+            {"Accept", "application/json"},
+            {"Content-Type", "application/json"},
+            {"X-Goog-Upload-Protocol", "resumable"},
+            {"X-Goog-Upload-Command", "start"},
+            {"X-Goog-Upload-Header-Content-Length", content_length},
+            {"X-Goog-Upload-Header-Content-Type", kAudioMimeType},
+        },
+        metadata_len, [&](esp_http_client_handle_t client) {
+            return esp_http_client_write(client, metadata, static_cast<int>(metadata_len)) ==
+                   static_cast<int>(metadata_len);
+        });
 }
 
-HttpResponse PerformUploadFinalizePcmWav(const std::string& upload_url,
-                                         const recording_service::RecordedClip& clip)
+// Stream the WAV (44-byte header, then the PCM chunks straight from PSRAM) to the upload URL and
+// finalize it. No API-key header: the upload URL already identifies the session.
+HttpResponse SessionUploadFinalize(HttpSession& session, const std::string& upload_url,
+                                   const recording_service::RecordedClip& clip)
 {
-    HttpResponse response = {};
+    return session.Exchange(
+        upload_url, kTranscribeTimeoutMs, kDefaultMaxResponseBytes,
+        {
+            {"Accept", "application/json"},
+            {"X-Goog-Upload-Offset", "0"},
+            {"X-Goog-Upload-Command", "upload, finalize"},
+        },
+        clip.wav_byte_count(), [&](esp_http_client_handle_t client) {
+            const std::array<uint8_t, 44> header =
+                BuildWavHeaderPcm16Mono(clip.sample_count(), clip.sample_rate_hz());
+            if (esp_http_client_write(client, reinterpret_cast<const char*>(header.data()),
+                                      static_cast<int>(header.size())) !=
+                static_cast<int>(header.size())) {
+                return false;
+            }
+            bool write_failed = false;
+            clip.ForEachChunk([&](const int16_t* chunk_data, size_t chunk_size) {
+                if (write_failed || chunk_data == nullptr || chunk_size == 0) {
+                    return;
+                }
+                const int bytes_to_write = static_cast<int>(chunk_size * sizeof(int16_t));
+                const int written = esp_http_client_write(
+                    client, reinterpret_cast<const char*>(chunk_data), bytes_to_write);
+                if (written != bytes_to_write) {
+                    write_failed = true;
+                }
+            });
+            return !write_failed;
+        });
+}
 
-    esp_http_client_config_t config = {};
-    config.url = upload_url.c_str();
-    config.method = HTTP_METHOD_POST;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.timeout_ms = kTranscribeTimeoutMs;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == nullptr) {
-        response.error_code = "http_client_init_failed";
-        response.error_message = "Failed to initialize Gemini upload finalize client";
-        return response;
-    }
-
-    const size_t total_bytes = clip.wav_byte_count();
-    char content_length[32] = {};
-    std::snprintf(content_length, sizeof(content_length), "%u", static_cast<unsigned>(total_bytes));
-    esp_http_client_set_header(client, "Content-Length", content_length);
-    esp_http_client_set_header(client, "Accept", "application/json");
-    esp_http_client_set_header(client, "X-Goog-Upload-Offset", "0");
-    esp_http_client_set_header(client, "X-Goog-Upload-Command", "upload, finalize");
-
-    esp_err_t err = esp_http_client_open(client, total_bytes);
-    if (err != ESP_OK) {
-        response.error_code = "transport_error";
-        response.error_message = esp_err_to_name(err);
-        esp_http_client_cleanup(client);
-        return response;
-    }
-
-    const std::array<uint8_t, 44> header =
-        BuildWavHeaderPcm16Mono(clip.sample_count(), clip.sample_rate_hz());
-    const int header_written = esp_http_client_write(
-        client, reinterpret_cast<const char*>(header.data()), static_cast<int>(header.size()));
-    if (header_written != static_cast<int>(header.size())) {
-        response.error_code = "transport_error";
-        response.error_message = "Failed writing WAV header";
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return response;
-    }
-
-    bool write_failed = false;
-    clip.ForEachChunk([&](const int16_t* chunk_data, size_t chunk_size) {
-        if (write_failed || chunk_data == nullptr || chunk_size == 0) {
-            return;
-        }
-        const int bytes_to_write = static_cast<int>(chunk_size * sizeof(int16_t));
-        const int written =
-            esp_http_client_write(client, reinterpret_cast<const char*>(chunk_data), bytes_to_write);
-        if (written != bytes_to_write) {
-            write_failed = true;
-        }
-    });
-    if (write_failed) {
-        response.error_code = "transport_error";
-        response.error_message = "Failed streaming Gemini audio upload";
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return response;
-    }
-
-    const int response_length = esp_http_client_fetch_headers(client);
-    response.status_code = esp_http_client_get_status_code(client);
-    if (response.status_code <= 0 && response_length < 0) {
-        response.error_code = "transport_error";
-        response.error_message = "Failed fetching Gemini upload response headers";
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return response;
-    }
-    ReadHttpResponseBody(client, &response);
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    return response;
+// generateContent on an existing session.
+HttpResponse SessionGenerateContent(HttpSession& session, const std::string& api_key,
+                                    const std::string& model_name, const std::string& body)
+{
+    const std::string url = std::string(kGeminiApiBaseUrl) + model_name + ":generateContent";
+    return session.Exchange(
+        url, kGenerateTimeoutMs, kGenerateMaxResponseBytes,
+        {
+            {"x-goog-api-key", api_key.c_str()},
+            {"Accept", "application/json"},
+            {"Content-Type", "application/json"},
+        },
+        body.size(), [&](esp_http_client_handle_t client) {
+            return esp_http_client_write(client, body.c_str(), static_cast<int>(body.size())) ==
+                   static_cast<int>(body.size());
+        });
 }
 
 std::string BuildTranscriptRequestJson(const std::string& file_uri)
@@ -1064,6 +1349,7 @@ std::string BuildTranscriptRequestJson(const std::string& file_uri)
 
     cJSON* generation_config = cJSON_AddObjectToObject(root, "generationConfig");
     cJSON_AddNumberToObject(generation_config, "temperature", 0);
+    cJSON_AddNumberToObject(generation_config, "maxOutputTokens", kTranscriptMaxOutputTokens);
 
     char* raw = cJSON_PrintUnformatted(root);
     std::string json = raw != nullptr ? raw : "";
@@ -1074,12 +1360,105 @@ std::string BuildTranscriptRequestJson(const std::string& file_uri)
     return json;
 }
 
-HttpResponse PerformGenerateContentWithBody(const std::string& api_key,
-                                            const std::string& model_name,
-                                            const std::string& request_json)
+// A Files API resource name looks like "files/abc-123". It is spliced into a request URL, so only
+// accept that exact shape rather than trusting whatever the server returned.
+bool IsValidUploadedFileName(const std::string& name)
 {
-    const std::string url = std::string(kGeminiApiBaseUrl) + model_name + ":generateContent";
-    return PerformGeminiPost(url, api_key, request_json);
+    static constexpr const char* kPrefix = "files/";
+    static constexpr size_t kPrefixLen = 6;
+    if (name.size() <= kPrefixLen || name.size() > 128 ||
+        name.compare(0, kPrefixLen, kPrefix) != 0) {
+        return false;
+    }
+    for (size_t i = kPrefixLen; i < name.size(); ++i) {
+        const char ch = name[i];
+        const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' ||
+                        ch == '_';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+HttpResponse PerformDeleteFile(const std::string& api_key, const std::string& file_name)
+{
+    HttpResponse response = {};
+    const std::string url = std::string(kGeminiApiBaseUrl) + file_name;
+
+    esp_http_client_config_t config = {};
+    config.url = url.c_str();
+    config.method = HTTP_METHOD_DELETE;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+    config.timeout_ms = kAuthTimeoutMs;
+    config.event_handler = &HttpEventHandler;
+    config.user_data = &response;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == nullptr) {
+        response.error_code = "http_client_init_failed";
+        response.error_message = "Failed to initialize Gemini delete client";
+        return response;
+    }
+
+    esp_http_client_set_header(client, "x-goog-api-key", api_key.c_str());
+    esp_http_client_set_header(client, "Accept", "application/json");
+    esp_http_client_set_header(client, "User-Agent", "folloup-sticky");
+
+    const esp_err_t err = esp_http_client_perform(client);
+    response.status_code = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        response.error_code = "transport_error";
+        response.error_message = esp_err_to_name(err);
+    }
+    MarkIfTruncated(&response);
+    return response;
+}
+
+// Outcome of one start+finalize upload attempt.
+struct UploadOutcome {
+    bool success = false;
+    HttpResponse finalize = {};  // the finalize response (file JSON) on success
+    HttpResponse failed = {};    // the response of whichever step failed, when !success
+    const char* failed_code = "";     // fallback error code if `failed` carries none
+    const char* failed_message = "";  // fallback message if `failed` carries none
+};
+
+bool IsSuccessful(const HttpResponse& response)
+{
+    return response.error_code.empty() && response.status_code >= 200 &&
+           response.status_code < 300;
+}
+
+// One attempt at uploading the clip: start the resumable session, then stream and finalize. A
+// failed resumable upload can't be resumed safely from here, so the caller retries the whole unit
+// (on a fresh connection) rather than just the failed step.
+UploadOutcome UploadClipOnce(HttpSession& session, const std::string& api_key,
+                             const recording_service::RecordedClip& clip)
+{
+    UploadOutcome outcome = {};
+
+    HttpResponse start = SessionUploadStart(session, api_key, clip.wav_byte_count());
+    if (!IsSuccessful(start) || start.upload_url.empty()) {
+        outcome.failed = std::move(start);
+        outcome.failed_code = "upload_start_failed";
+        outcome.failed_message = "Failed to start Gemini file upload";
+        return outcome;
+    }
+
+    HttpResponse finalize = SessionUploadFinalize(session, start.upload_url, clip);
+    if (!IsSuccessful(finalize)) {
+        outcome.failed = std::move(finalize);
+        outcome.failed_code = "upload_finalize_failed";
+        outcome.failed_message = "Failed to upload Gemini audio file";
+        return outcome;
+    }
+
+    outcome.finalize = std::move(finalize);
+    outcome.success = true;
+    return outcome;
 }
 
 uint32_t ResolveUploadChunkCount(const recording_service::RecordedClip& clip)
@@ -1285,6 +1664,10 @@ std::string GetEffectiveModelName()
 TextResult GenerateText(const std::string& prompt)
 {
     TextResult result = {};
+    // Hold the network lock for the whole exchange, and read the key after acquiring it so a
+    // request that waited behind another one doesn't send a stale key.
+    std::lock_guard<std::mutex> network_lock(s_network_mutex);
+    const uint32_t auth_generation = CurrentAuthGeneration();
     const std::string api_key = GetEffectiveApiKey();
     const std::string model_name = GetEffectiveModelName();
     if (api_key.empty() || model_name.empty()) {
@@ -1299,7 +1682,8 @@ TextResult GenerateText(const std::string& prompt)
     }
 
     const std::string url = std::string(kGeminiApiBaseUrl) + model_name + ":generateContent";
-    const HttpResponse http = PerformGeminiPost(url, api_key, BuildTextRequestBody(prompt, true));
+    const HttpResponse http =
+        PerformGeminiPostWithRetry("generateContent", url, api_key, BuildTextRequestBody(prompt));
     result.http_status = http.status_code;
     if (!http.error_code.empty()) {
         result.error_code = http.error_code;
@@ -1309,6 +1693,10 @@ TextResult GenerateText(const std::string& prompt)
         if (http.status_code >= 200 && http.status_code < 300) {
             result.text = ExtractCandidateText(root);
             result.success = !result.text.empty();
+            if (CandidateHitTokenLimit(root)) {
+                ESP_LOGW(kTag, "Gemini output hit maxOutputTokens (%d); text may be cut off",
+                         kTextMaxOutputTokens);
+            }
             if (!result.success) {
                 result.error_code = "empty_response";
                 result.error_message = "Gemini returned no text";
@@ -1329,61 +1717,14 @@ TextResult GenerateText(const std::string& prompt)
                  result.http_status,
                  result.error_code.empty() ? "<none>" : result.error_code.c_str(),
                  result.error_message.empty() ? "<none>" : result.error_message.c_str());
+        NoteRequestStatus(auth_generation, result.http_status, result.error_code,
+                          result.error_message);
     }
     return result;
 }
 
-TokenCountResult CountTokens(const std::string& prompt)
-{
-    TokenCountResult result = {};
-    const std::string api_key = GetEffectiveApiKey();
-    const std::string model_name = GetEffectiveModelName();
-    if (api_key.empty() || model_name.empty()) {
-        result.error_code = "not_configured";
-        result.error_message = "No Gemini API key configured";
-        return result;
-    }
-    if (prompt.empty()) {
-        result.success = true;  // an empty prompt is trivially zero tokens
-        return result;
-    }
-
-    const std::string url = std::string(kGeminiApiBaseUrl) + model_name + ":countTokens";
-    const HttpResponse http = PerformGeminiPost(url, api_key, BuildTextRequestBody(prompt, false));
-    result.http_status = http.status_code;
-    if (!http.error_code.empty()) {
-        result.error_code = http.error_code;
-        result.error_message = TrimForLog(http.error_message);
-        return result;
-    }
-
-    cJSON* root = cJSON_ParseWithLength(http.body.c_str(), http.body.size());
-    if (http.status_code >= 200 && http.status_code < 300) {
-        cJSON* total = root != nullptr
-                           ? cJSON_GetObjectItemCaseSensitive(root, "totalTokens")
-                           : nullptr;
-        if (cJSON_IsNumber(total)) {
-            result.total_tokens = total->valueint;
-            result.success = true;
-        } else {
-            result.error_code = "empty_response";
-            result.error_message = "Gemini returned no token count";
-        }
-    } else {
-        PopulateHttpError(root, http, &result.error_code, &result.error_message);
-    }
-    if (root != nullptr) {
-        cJSON_Delete(root);
-    }
-    if (!result.success) {
-        // Callers fall back to a size estimate, so this is debug-level to avoid chunking noise.
-        ESP_LOGD(kTag, "Gemini countTokens failed: http=%d code=%s", result.http_status,
-                 result.error_code.empty() ? "<none>" : result.error_code.c_str());
-    }
-    return result;
-}
-
-TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
+// The three-step upload + generateContent exchange. Callers must hold s_network_mutex.
+static TranscriptionResult TranscribeLocked(const recording_service::RecordedClip& clip)
 {
     TranscriptionResult result = {};
     result.clip_duration_ms = clip.duration_ms();
@@ -1405,42 +1746,53 @@ TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
 
     const int64_t task_started_us = esp_timer_get_time();
 
-    // 1. Start a resumable upload to obtain an upload URL.
-    HttpResponse upload_start = PerformUploadStart(api_key, clip.wav_byte_count());
-    if (!upload_start.error_code.empty() || upload_start.upload_url.empty() ||
-        upload_start.status_code < 200 || upload_start.status_code >= 300) {
-        result.http_status = upload_start.status_code;
-        result.error_code =
-            upload_start.error_code.empty() ? "upload_start_failed" : upload_start.error_code;
-        result.error_message = TrimForLog(
-            !upload_start.error_message.empty()
-                ? upload_start.error_message
-                : (!upload_start.body.empty() ? upload_start.body
-                                              : "Failed to start Gemini file upload"));
-        return result;
-    }
+    // One TLS connection carries all three requests (start upload, send audio, generateContent).
+    std::unique_ptr<HttpSession> session;
+    const auto open_session = [&session]() {
+        session.reset(new (std::nothrow) HttpSession());
+        return session != nullptr && session->valid();
+    };
 
-    // 2. Stream the WAV (header + PCM chunks) and finalize the upload.
+    // 1+2. Start the resumable upload and stream the WAV. Retried as a unit, each attempt on a
+    // fresh connection.
     const int64_t upload_started_us = esp_timer_get_time();
-    HttpResponse upload_finalize = PerformUploadFinalizePcmWav(upload_start.upload_url, clip);
-    result.http_status = upload_finalize.status_code;
+    UploadOutcome upload = {};
+    for (int attempt = 1;; ++attempt) {
+        if (!open_session()) {
+            result.error_code = "http_client_init_failed";
+            result.error_message = "Failed to initialize Gemini HTTP client";
+            return result;
+        }
+        upload = UploadClipOnce(*session, api_key, clip);
+        if (upload.success || !IsRetryableFailure(upload.failed) ||
+            attempt >= kMaxRequestAttempts ||
+            !WaitBeforeRetry("audio upload", attempt, upload.failed)) {
+            break;
+        }
+    }
     result.upload_elapsed_ms =
         static_cast<uint64_t>((esp_timer_get_time() - upload_started_us) / 1000ULL);
-    if (!upload_finalize.error_code.empty() || upload_finalize.status_code < 200 ||
-        upload_finalize.status_code >= 300) {
-        result.error_code = upload_finalize.error_code.empty() ? "upload_finalize_failed"
-                                                               : upload_finalize.error_code;
+    if (!upload.success) {
+        result.http_status = upload.failed.status_code;
+        result.error_code =
+            upload.failed.error_code.empty() ? upload.failed_code : upload.failed.error_code;
         result.error_message = TrimForLog(
-            !upload_finalize.error_message.empty()
-                ? upload_finalize.error_message
-                : (!upload_finalize.body.empty() ? upload_finalize.body
-                                                 : "Failed to upload Gemini audio file"));
+            !upload.failed.error_message.empty()
+                ? upload.failed.error_message
+                : (!upload.failed.body.empty() ? upload.failed.body : upload.failed_message));
         return result;
     }
+    result.http_status = upload.finalize.status_code;
 
     cJSON* file_root =
-        cJSON_ParseWithLength(upload_finalize.body.c_str(), upload_finalize.body.size());
+        cJSON_ParseWithLength(upload.finalize.body.c_str(), upload.finalize.body.size());
     const std::string file_uri = JsonNestedStringField(file_root, "file", "uri");
+    // Remember the uploaded file so the caller can delete it once the result is published. Set
+    // before any later failure return so a failed generateContent still gets cleaned up.
+    const std::string file_name = JsonNestedStringField(file_root, "file", "name");
+    if (IsValidUploadedFileName(file_name)) {
+        result.uploaded_file_name = file_name;
+    }
     if (file_root != nullptr) {
         cJSON_Delete(file_root);
     }
@@ -1450,9 +1802,24 @@ TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
         return result;
     }
 
-    // 3. generateContent referencing the uploaded file.
-    HttpResponse http =
-        PerformGenerateContentWithBody(api_key, model_name, BuildTranscriptRequestJson(file_uri));
+    // 3. generateContent referencing the uploaded file. The first attempt reuses the upload's
+    // connection; after a failure, retry on a fresh one. Only this step is retried: the file is
+    // already uploaded, so there is no reason to send the audio again.
+    const std::string generate_body = BuildTranscriptRequestJson(file_uri);
+    HttpResponse http = {};
+    for (int attempt = 1;; ++attempt) {
+        if (session == nullptr && !open_session()) {
+            result.error_code = "http_client_init_failed";
+            result.error_message = "Failed to initialize Gemini HTTP client";
+            return result;
+        }
+        http = SessionGenerateContent(*session, api_key, model_name, generate_body);
+        if (!IsRetryableFailure(http) || attempt >= kMaxRequestAttempts ||
+            !WaitBeforeRetry("transcript generation", attempt, http)) {
+            break;
+        }
+        session.reset();
+    }
     result.http_status = http.status_code;
     result.total_elapsed_ms =
         static_cast<uint64_t>((esp_timer_get_time() - task_started_us) / 1000ULL);
@@ -1466,6 +1833,10 @@ TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
     if (http.status_code >= 200 && http.status_code < 300) {
         result.transcript = TrimForLog(ExtractCandidateText(root), 1U << 20);
         result.success = !result.transcript.empty();
+        if (CandidateHitTokenLimit(root)) {
+            ESP_LOGW(kTag, "Gemini transcript hit maxOutputTokens (%d); text may be cut off",
+                     kTranscriptMaxOutputTokens);
+        }
         if (!result.success) {
             result.error_code = "empty_transcript";
             result.error_message = "Gemini returned no transcript text";
@@ -1477,6 +1848,43 @@ TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
         cJSON_Delete(root);
     }
     return result;
+}
+
+TranscriptionResult Transcribe(const recording_service::RecordedClip& clip)
+{
+    // One lock across all three sessions (start, upload, generate) so no other Gemini exchange
+    // interleaves and holds a second TLS session open alongside them.
+    std::lock_guard<std::mutex> network_lock(s_network_mutex);
+    const uint32_t auth_generation = CurrentAuthGeneration();
+    TranscriptionResult result = TranscribeLocked(clip);
+    if (!result.success) {
+        NoteRequestStatus(auth_generation, result.http_status, result.error_code,
+                          result.error_message);
+    }
+    return result;
+}
+
+void DeleteUploadedFile(const std::string& file_name)
+{
+    if (!IsValidUploadedFileName(file_name)) {
+        return;
+    }
+    // Best effort: uploaded files expire on Google's side after about 48 hours regardless, so a
+    // failure here only means the file lingers a little longer. Serialized like every other
+    // Gemini exchange.
+    std::lock_guard<std::mutex> network_lock(s_network_mutex);
+    const std::string api_key = GetEffectiveApiKey();
+    if (api_key.empty()) {
+        return;
+    }
+    const HttpResponse http = PerformDeleteFile(api_key, file_name);
+    if (http.error_code.empty() && http.status_code >= 200 && http.status_code < 300) {
+        ESP_LOGI(kTag, "Deleted uploaded Gemini file %s", file_name.c_str());
+    } else {
+        ESP_LOGW(kTag, "Could not delete uploaded Gemini file %s: http=%d code=%s",
+                 file_name.c_str(), http.status_code,
+                 http.error_code.empty() ? "<none>" : http.error_code.c_str());
+    }
 }
 
 bool BeginAuthentication()
@@ -1584,10 +1992,18 @@ bool BeginAuthentication()
 
 void SetNetworkState(bool connected, bool access_point_mode)
 {
+    bool ready_changed = false;
     {
         std::lock_guard<std::mutex> lock(s_mutex);
+        // `ready` includes connectivity, so a drop or return flips it for dependents (status
+        // bar icon, summary/transcription gating) without waiting for another event.
+        ready_changed = s_authenticated && s_network_connected != connected &&
+                        !GetEffectiveApiKeyLocked().empty();
         s_network_connected = connected;
         s_access_point_mode = access_point_mode;
+    }
+    if (ready_changed) {
+        Notify();
     }
     MaybeBeginAuthentication();
 }

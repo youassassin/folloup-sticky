@@ -108,6 +108,13 @@ void WorkerTask(void* raw_context)
         NotifyLocked();
     }
 
+    // The result is already published, so clean up the uploaded audio off the user's critical
+    // path. The in-flight flag is clear by now; a new request that starts meanwhile simply
+    // queues behind this on gemini_service's network lock.
+    if (!result.uploaded_file_name.empty()) {
+        gemini_service::DeleteUploadedFile(result.uploaded_file_name);
+    }
+
     vTaskDelete(nullptr);
 }
 

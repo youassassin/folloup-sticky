@@ -76,15 +76,6 @@ struct TextResult {
     std::string error_message = {};
 };
 
-// Result of a synchronous token-count (countTokens) call.
-struct TokenCountResult {
-    bool success = false;
-    int http_status = 0;
-    int total_tokens = 0;
-    std::string error_code = {};
-    std::string error_message = {};
-};
-
 // Result of a synchronous audio transcription (resumable upload + generateContent) call.
 struct TranscriptionResult {
     bool success = false;
@@ -92,6 +83,9 @@ struct TranscriptionResult {
     std::string transcript = {};
     std::string error_code = {};
     std::string error_message = {};
+    // Files API resource name ("files/...") of the audio uploaded for this request, empty if the
+    // upload never completed. Pass it to DeleteUploadedFile() once the result has been handled.
+    std::string uploaded_file_name = {};
     uint32_t clip_duration_ms = 0;
     size_t wav_bytes = 0;
     uint32_t upload_chunk_count = 0;
@@ -113,9 +107,15 @@ std::string GetEffectiveApiKey();
 std::string GetEffectiveModelName();
 // Synchronous Gemini calls (block on HTTP; run them from a worker task, never a UI/input
 // task). They use the effective API key + model and return the parsed result or an error.
+// All Gemini HTTPS exchanges (these plus authentication) are serialized internally, so a call
+// may also block while another one finishes. A 401/403 response clears the authenticated state
+// (runtime.ready goes false) and triggers re-validation.
 TextResult GenerateText(const std::string& prompt);
-TokenCountResult CountTokens(const std::string& prompt);
 TranscriptionResult Transcribe(const recording_service::RecordedClip& clip);
+// Best-effort delete of a file uploaded by Transcribe() (see uploaded_file_name). Call it after
+// the transcription result has been published so the extra HTTPS round trip doesn't delay it.
+// Failures are logged and ignored; uploads expire server-side on their own.
+void DeleteUploadedFile(const std::string& file_name);
 bool BeginAuthentication();
 void SetNetworkState(bool connected, bool access_point_mode);
 void RegisterPortalRoutes(httpd_handle_t server);

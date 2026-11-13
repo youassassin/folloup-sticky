@@ -92,18 +92,21 @@ bool IsNotesRecordingTag(RecordingTag tag)
     return !IsTodoRecordingTag(tag);
 }
 
+// Roughly 4 characters per token. This is a local estimate on purpose: asking the API to count
+// tokens costs a full TLS session plus a re-upload of the whole prompt per call, and the budgets
+// below sit far under the model's context window, so an approximate count is enough to decide
+// whether to trim or chunk.
 size_t EstimateTokenCount(const std::string& text)
 {
     return std::max<size_t>(1U, text.size() / 4U);
 }
 
-// --- gemini wrappers (synchronous; run on the worker task) -----------------
-
 size_t CountPromptTokens(const std::string& prompt)
 {
-    const gemini_service::TokenCountResult result = gemini_service::CountTokens(prompt);
-    return result.success ? static_cast<size_t>(result.total_tokens) : EstimateTokenCount(prompt);
+    return EstimateTokenCount(prompt);
 }
+
+// --- gemini wrappers (synchronous; run on the worker task) -----------------
 
 bool GeneratePromptTextResult(const std::string& prompt, std::string* text_out,
                               std::string* error_code_out, std::string* error_message_out)
