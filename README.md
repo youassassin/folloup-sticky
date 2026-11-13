@@ -63,8 +63,8 @@ Followup runs on the [Waveshare ESP32-S3-ePaper-3.97](https://docs.waveshare.com
 | --- | --- |
 | Product Name | Followup (on ESP32-S3-ePaper-3.97) |
 | Product Type | Voice-capture notes app on an ePaper terminal |
-| MCU | ESP32-S3R8, dual-core Xtensa LX7 up to 240MHz |
-| Memory | 8MB PSRAM, 16MB flash |
+| MCU | ESP32-S3-WROOM-1-N16R8 module (ESP32-S3R8, dual-core Xtensa LX7 up to 240MHz) |
+| Memory | 8MB octal PSRAM, 16MB flash |
 | Screen | 3.97-inch black-and-white ePaper, 800 x 480, SSD1677 controller |
 | Interaction | Buttons only — this board has no touchscreen (see [Controls](#controls)) |
 | Connectivity | 2.4GHz Wi-Fi (802.11 b/g/n), Bluetooth 5 (LE) |
@@ -92,6 +92,19 @@ Followup is driven entirely by the three physical controls: a rocker, the BOOT b
 | PWR, hold 6s | Hardware power-off, straight from the PMIC |
 
 Recording is exclusive to BOOT, so no other control can start or stop a capture by accident. The 6-second PWR hold bypasses the firmware entirely and always cuts power.
+
+## Developer Documentation
+
+The firmware is an ESP-IDF (v5.4) C++17 project for the ESP32-S3.
+
+| Document | Covers |
+| --- | --- |
+| [`docs/app-architecture.md`](docs/app-architecture.md) | Components, runtime helpers, startup order, input model, task mapping |
+| [`docs/waveshare-epaper-hardware-spec.md`](docs/waveshare-epaper-hardware-spec.md) | Pin map, I2C addresses, power rails, sleep and wake, USB storage mode |
+| [`docs/gemini-service.md`](docs/gemini-service.md) | Gemini auth, transcription, summaries, retries, and API endpoints |
+| [`docs/auto-sleep.md`](docs/auto-sleep.md) | Inactivity detection, display sleep, and light sleep |
+| [`docs/asset-generation.md`](docs/asset-generation.md) | Generating icon, logo, and font assets (macOS only) |
+| [`webserver/README.md`](webserver/README.md) | The Wi-Fi / API key / time setup portal |
 
 ## Product Value Summary
 

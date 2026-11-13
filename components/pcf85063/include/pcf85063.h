@@ -8,9 +8,8 @@
 #include "driver/i2c_master.h"
 #include "esp_err.h"
 
-// Free-function driver for the NXP PCF85063 RTC on the Waveshare board. It mirrors
-// the interface the power service expects (previously the PCF8563 on Sticky) so the
-// service layer is register-map agnostic; only the chip underneath changed.
+// Free-function driver for the NXP PCF85063 RTC on the Waveshare board. It exposes the
+// interface the power service expects, so the service layer stays register-map agnostic.
 namespace pcf85063 {
 
 struct InterruptStatus {

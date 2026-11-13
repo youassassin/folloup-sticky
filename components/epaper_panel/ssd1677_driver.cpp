@@ -15,9 +15,8 @@ constexpr const char* kTag = "Ssd1677";
 // enough for the fade to become obvious; the flush is now on the fast waveform, so a
 // tighter budget costs little.
 constexpr int kMaxPartialRefreshesBeforeFlush = 8;
-// Display Update Control 2 (0x22) sequences, matching the `followup` esp-epaper driver
-// that is proven on this panel: 0xF7 drives the mode-1 full waveform, 0xFF the mode-2
-// differential waveform used for partials.
+// Display Update Control 2 (0x22) sequences, proven on this panel: 0xF7 drives the mode-1
+// full waveform, 0xFF the mode-2 differential waveform used for partials.
 //
 // Display Update Control 1 (0x21) is deliberately never written. Its reset default is
 // "normal" for both RAM planes, which is what makes the panel compare 0x24 against 0x26

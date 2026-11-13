@@ -68,9 +68,8 @@ with a full refresh.
 After the configured light-sleep timeout has elapsed during the same no-motion
 period, the runtime enters ESP32-S3 light sleep.
 
-There is no power latch to protect on this board -- the AXP2101 holds the rails
-across light sleep on its own, which removes the Sticky's whole `PWR_HOLD` /
-`PWR_LOCK` sleep-GPIO problem.
+There is no power latch to protect on this board: the AXP2101 holds the rails
+across light sleep on its own, so no sleep-time GPIO has to keep power on.
 
 One protection does carry over: `ACTION` / `GPIO0` is both a light-sleep wake
 source and the app's record button. The runtime arms wake-only suppression before
@@ -100,13 +99,17 @@ The light-sleep sequence is:
 11. Consume the wake-causing power-button event as wake-only.
 12. Restore the display with a forced full refresh, even if software state has
     already moved back to awake.
+13. Remount the SD card and recover Wi-Fi. The SDMMC card loses its state across
+    light sleep, so the cached mount handle is stale on wake and the first read
+    would time out. This happens in the same restore step as the display
+    (`RestoreAfterLightSleep()`), through `storage_service::RecoverAfterLightSleep()`
+    and `wifi_service::RecoverAfterLightSleep()`.
 
 Normal awake-state power-button interactions remain available outside the
-light-sleep wake path. Today that means a short press of the
-`PWR` key toggles the lock screen, while a ~1s `PWR` hold opens the shutdown
-confirmation. Both arrive as AXP2101 interrupts rather than GPIO button events
-chord and then requires explicit confirmation through the global shutdown
-modal.
+light-sleep wake path. A short press of the `PWR` key toggles the lock screen,
+while a ~1s `PWR` hold opens the shutdown confirmation. Both arrive as AXP2101
+interrupts rather than GPIO button events, and shutdown always requires explicit
+confirmation through the global shutdown modal.
 
 ## Sleep Blockers
 
@@ -129,10 +132,11 @@ Plain USB power does not block auto sleep.
 During SD format, `storage_service::IsWriteBusy()` raises the `storage_write`
 blocker. That keeps the sleep state machine from entering display sleep or
 light sleep in the middle of the format operation. IMU motion polling still
-continues during that time, but it reads the QMI8658 over the shared sensor
-I2C bus and does not directly contend with the shared SPI bus used by MicroSD
-and the e-paper panel. Motion logs during formatting are therefore expected and
-are not, by themselves, evidence that the SD format path is being interrupted.
+continues during that time, but it reads the QMI8658 over the shared sensor I2C
+bus, which is separate from the SDMMC controller that MicroSD uses and from the
+SPI3 bus the e-paper panel uses. Motion logs during formatting are therefore
+expected and are not, by themselves, evidence that the SD format path is being
+interrupted.
 
 ## Configuration
 
@@ -161,8 +165,8 @@ stable enough for future hardware testing.
 ## Deferred FIFO And Shared ISR Plan
 
 FIFO-backed sampling and IMU interrupt handling are intentionally deferred.
-The current `200 ms` polling approach is simple, debuggable, responsive enough,
-and does not require sharing `GPIO7` between two interrupt sources.
+The current `200 ms` polling approach is simple, debuggable, and responsive
+enough, and it leaves the IMU interrupt line (`GPIO40`, INT2) unclaimed.
 
 FIFO should be revisited only if one of these becomes true:
 
@@ -179,14 +183,13 @@ IMU interrupt handling should be revisited only if one of these becomes true:
 - another feature needs IMU activity, inactivity, FIFO watermark, orientation,
   tap, or data-ready interrupts
 
-The QMI8658 IMU shares the sensor I2C bus with the PMIC and RTC. If the IMU
-interrupt path is added later, neither `power_service` nor `imu_service` should
-claim `GPIO7` independently. Add one shared-line owner that:
+The QMI8658 IMU shares the sensor I2C bus with the PMIC and RTC, but its
+interrupt is a separate line from the PMIC's: IMU INT2 is `GPIO40`, and the
+AXP2101 IRQ is `GPIO38`. The PMIC line is already a light-sleep wake source, so
+if an IMU interrupt path is added later:
 
-- owns the `GPIO7` ISR
-- keeps the ISR minimal
-- defers all I2C work to a task
-- checks and logs PMIC interrupt state without losing existing diagnostics
-- checks and logs IMU interrupt source or FIFO state
-- identifies which source asserted the shared line
-- preserves current auto-sleep behavior until the new interrupt path is proven
+- give `GPIO40` a single owner, with a minimal ISR that defers all I2C work to a
+  task
+- check and log IMU interrupt source or FIFO state
+- keep the PMIC IRQ handling and its diagnostics unchanged
+- preserve current auto-sleep behavior until the new interrupt path is proven

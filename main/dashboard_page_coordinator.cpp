@@ -26,7 +26,7 @@ constexpr int64_t kMinValidEpoch = 1704067200;  // 2024-01-01 UTC
 //
 // So mix in sources that do vary at this point:
 //   - the RTC-backed wall clock, which differs on every boot (timezone_service restores it
-//     from the PCF8563 before the home screen is shown);
+//     from the PCF85063 before the home screen is shown);
 //   - the boot-relative microsecond timer, which jitters with SD mount and display init
 //     timing and covers the first-ever boot where the RTC has not been set yet.
 uint32_t WelcomeSeedEntropy()

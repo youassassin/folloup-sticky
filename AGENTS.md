@@ -1,8 +1,10 @@
 # Agent Notes
 
 Read `docs/app-architecture.md` before changing the firmware architecture,
-component boundaries, BQ27220 integration, board wiring, partition layout, or
-ESP-IDF configuration.
+component boundaries, AXP2101 power/PMIC integration, board wiring, partition
+layout, or ESP-IDF configuration. The target hardware is the Waveshare
+ESP32-S3-ePaper-3.97; see `docs/waveshare-epaper-hardware-spec.md` for the pin map
+and board details.
 
 Keep `main/app_shell.cpp` as an orchestration layer. Before adding logic there,
 ask whether the behavior belongs in a service/component or a focused runtime

@@ -365,9 +365,9 @@ esp_err_t EnterLightSleep()
 
     // Restore the FN pad and the button poller before anything slow (logging is ~10ms per
     // line at 115200 baud), so the wake press is still being held when polling resumes and
-    // the gesture can be classified. Unlike the Sticky's EXT1 path there is no RTC re-mux
-    // to undo here: gpio_wakeup_enable leaves the pad on the digital peripheral, so the
-    // level read below is genuine.
+    // the gesture can be classified. There is no RTC re-mux to undo here (this is the
+    // GPIO-wake path, not EXT1): gpio_wakeup_enable leaves the pad on the digital
+    // peripheral, so the level read below is genuine.
     const esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
     DisarmLightSleepGpioWake();
     const esp_err_t reconfig_err = ConfigurePowerButtonWakeInput("post-light-sleep");

@@ -1292,9 +1292,9 @@ void HandleDispatchedButtonEvent(const button_service::ButtonEventInfo& event)
         return;
     }
 
-    // No UP+power shutdown chord on this board. That gesture existed for the Sticky's
-    // discrete power latch; here the AXP2101 owns power-off through its own key, so a
-    // chord would only duplicate it and can misfire during navigation.
+    // No UP+power shutdown chord on this board. The AXP2101 owns power-off through its own
+    // key (see HandlePowerKeyPress), so a chord would only duplicate it and can misfire
+    // during navigation.
 
     const device_sleep_service::Stage stage_before =
         device_sleep_service::GetSnapshot().runtime.stage;
@@ -1729,8 +1729,8 @@ void Run()
     ESP_ERROR_CHECK(power_service::Init());
     power_service::LogDebugStatus();
     InitFeedbackService();
-    // On this board the SD card needs to enter and stay in SPI mode before
-    // the shared-bus display path is brought up.
+    // The SD card (SDMMC) and the panel (SPI3) are on separate controllers, so storage and
+    // display bring-up have no ordering requirement relative to each other.
     InitStorageService();
     InitDisplayService();
     InitUiRefreshRuntime();

@@ -1,7 +1,7 @@
 # Asset Generation
 
-The e-paper UI asset generation pipeline is staged in this repo so the app UI
-can use generated monochrome image and bitmap-font assets.
+The e-paper UI asset generation pipeline lives in this repo so the app UI can use
+generated monochrome image and bitmap-font assets for the 800 x 480 SSD1677 panel.
 
 ## Source Roots
 
@@ -9,8 +9,10 @@ can use generated monochrome image and bitmap-font assets.
 - `assets/logos/`: source PNG logos that preserve source aspect ratio.
 - `fonts/`: source Inter TTF files for packed bitmap fonts.
 
-The current scripts are macOS-oriented because they use `sips` for PNG
-conversion and CoreGraphics/CoreText for font rasterization.
+The current scripts are macOS-only because they use `sips` for PNG conversion and
+CoreGraphics/CoreText for font rasterization. They will not run on Windows or
+Linux as written. The generated C++ is checked in, so you only need a Mac (or a
+port of the scripts) when you add or change an icon, logo, or font.
 
 ## Scripts
 
@@ -49,13 +51,13 @@ should not require changing CMake.
 
 ## Embedded Bitmap Fonts
 
-Bitmap font generation is now compiled through `components/epaper_ui/`:
+Bitmap fonts are compiled through `components/epaper_ui/`:
 
 - `components/epaper_ui/generated_epaper_fonts.cpp`
 - `components/epaper_ui/include/epaper_ui/generated_epaper_fonts.h`
 
-The current renderer uses the same Inter font sizes and weights expected by the
-ported `followup` design-token roles.
+The current renderer uses the Inter font sizes and weights that the
+`design_tokens` typography roles expect.
 
 Regenerate the font source with `scripts/generate_epaper_fonts.py`, then keep
 the small public header in sync if new symbols are added.

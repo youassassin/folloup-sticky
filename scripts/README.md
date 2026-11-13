@@ -1,7 +1,7 @@
 # Scripts
 
-This repo keeps e-paper asset generators ported from the sibling `followup`
-firmware repo.
+This folder holds the e-paper asset generators for the Waveshare
+ESP32-S3-ePaper-3.97 UI. See `docs/asset-generation.md` for the full workflow.
 
 ## E-paper Assets
 
@@ -21,7 +21,9 @@ The generators emit monochrome C++ assets for the SSD1677 e-paper UI:
   image assets
 
 The PNG generators use macOS `sips`, and the font generator uses macOS
-CoreGraphics/CoreText through `ctypes`.
+CoreGraphics/CoreText through `ctypes`, so these scripts only run on macOS. The
+generated C++ is checked in; you only need to run them when you add or change an
+icon, logo, or font.
 
 For normal UI work, update `assets/epaper_assets.json` and run:
 

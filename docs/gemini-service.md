@@ -1,37 +1,39 @@
 # Gemini Service
 
-This document describes the current Gemini integration used by the Followup
-firmware.
+This document describes the Gemini integration in the Followup firmware.
 
-`components/gemini_service/` currently owns:
+`components/gemini_service/` owns:
 
-- Gemini API key storage precedence
-- Gemini authentication state
+- Gemini API key storage and precedence
+- Gemini authentication state and readiness
+- every HTTPS exchange with the Gemini API: authentication, text generation
+  (`GenerateText`), and audio transcription (`Transcribe`, including the Files
+  API upload and clean-up)
 - backend HTTP routes for Gemini settings and runtime state
-- Wi-Fi-driven Gemini readiness
-- Gemini-ready status consumed by the status bar
+- Wi-Fi-driven Gemini readiness, consumed by the status bar
 
 It does not own:
 
-- transcription requests — owned by the `transcription_service` component
-- summary generation — owned by the `summary_service` component
-- archived recording enrichment / indexing — owned by
-  `recording_archive_service`
-- a frontend portal UI
-
-`transcription_service` and `summary_service` call the Gemini API directly; they
-were split into their own components rather than living inside `gemini_service`,
-which remains focused on key/settings precedence, auth readiness, and status.
+- the async lifecycle of a transcription request: that is `transcription_service`,
+  which calls `gemini_service::Transcribe`
+- summary prompts, chunking, caching, and the request queue: that is
+  `summary_service`, which calls `gemini_service::GenerateText`
+- archived recording indexing: `recording_archive_service`
+- the setup-portal front end: `webserver/` (see `webserver/README.md`), which is
+  embedded into `wifi_service` and talks to the routes below
 
 ## Ownership
 
-Current runtime split:
+Runtime split:
 
 - `gemini_service`
-  - Gemini configuration, API key precedence, auth requests, auth state, and
+  - configuration, API key precedence, all Gemini HTTP requests, auth state, and
     backend route handlers
+- `transcription_service` / `summary_service`
+  - own the worker task or queue for a feature, build the inputs, and publish
+    results; they hold no Gemini HTTP code themselves
 - `wifi_service`
-  - owns the backend HTTP server and hosts Gemini routes through the existing
+  - owns the backend HTTP server and hosts the Gemini routes through the existing
     portal route registrar
 - `main/app_shell.cpp`
   - initializes the service, forwards Wi-Fi network state into Gemini, logs
@@ -41,35 +43,35 @@ Current runtime split:
 - `components/epaper_ui/`
   - renders the Gemini-ready star icon in the status bar
 - `feedback_service` / `system_sound_service`
-  - play a dedicated Gemini-connected cue when readiness transitions from false
-    to true
+  - play a dedicated Gemini-connected cue when readiness goes from false to true
 
-`app_shell` remains an orchestrator here. The Gemini service owns the provider
-state and route behavior; `app_shell` only wires events, startup order, and
+`app_shell` remains an orchestrator here. The Gemini service owns provider state
+and route behavior; `app_shell` only wires events, startup order, and
 product-facing reactions.
 
 ## Internal Layout
 
-Followup currently uses a single-file Gemini service implementation:
+The service is a single implementation file:
 
-- [`components/gemini_service/include/gemini_service.h`](/Users/tieuvong/Development/folloup-sticky/components/gemini_service/include/gemini_service.h)
-- [`components/gemini_service/gemini_service.cpp`](/Users/tieuvong/Development/folloup-sticky/components/gemini_service/gemini_service.cpp)
+- [`components/gemini_service/include/gemini_service.h`](../components/gemini_service/include/gemini_service.h)
+- [`components/gemini_service/gemini_service.cpp`](../components/gemini_service/gemini_service.cpp)
 
-Current internal responsibilities inside that component:
+Internal responsibilities inside that component:
 
 - NVS read/write of the stored Gemini API key
-- sdkconfig fallback key lookup
-- effective-key precedence resolution
-- HTTP `GET` model authentication against Gemini
+- sdkconfig fallback key lookup and effective-key precedence
+- the `HttpSession` helper and per-request helpers (auth `GET`, `generateContent`,
+  resumable file upload, file delete)
+- request serialization, retry/backoff, response caps, and key-rejection handling
 - auth task lifecycle and stale-result protection
 - backend JSON request/response handling
 
-Followup does not yet split this into separate `client`, `worker`, and
-`settings_storage` files the way Followup does.
+If the file grows further, the natural split is `client` (HTTP and retry),
+`worker` (auth task), and `settings_storage` (NVS and precedence).
 
 ## API Key Sources
 
-Current API key precedence:
+API key precedence:
 
 1. NVS-stored key saved through the backend API
 2. built-in `CONFIG_FOLLOWUP_GEMINI_API_KEY`
@@ -85,19 +87,13 @@ The build-time Gemini setting lives under `Folloup Settings`:
 - `CONFIG_FOLLOWUP_GEMINI_API_KEY`
 
 This is intended for development and bench testing. A key saved through the
-backend API takes precedence over the built-in key.
-
-The reproducible default is set in:
-
-- [`sdkconfig.defaults`](/Users/tieuvong/Development/folloup-sticky/sdkconfig.defaults)
-
-Current default:
-
-- `CONFIG_FOLLOWUP_GEMINI_API_KEY=""`
+backend API takes precedence over the built-in key. The reproducible default is
+set in [`sdkconfig.defaults`](../sdkconfig.defaults) and is empty
+(`CONFIG_FOLLOWUP_GEMINI_API_KEY=""`).
 
 ## Startup And Readiness Flow
 
-Current auth flow:
+Auth flow:
 
 1. `app_shell` initializes `gemini_service`
 2. the service loads the stored NVS key, if present
@@ -109,8 +105,8 @@ Current auth flow:
    `https://generativelanguage.googleapis.com/v1beta/`
 7. successful auth marks the runtime snapshot ready
 8. the status bar shows the Gemini-ready star icon
-9. the feedback layer plays the Gemini-connected cue the first time readiness
-   transitions to true
+9. the feedback layer plays the Gemini-connected cue when readiness goes from
+   false to true
 
 Authentication is skipped when:
 
@@ -119,24 +115,49 @@ Authentication is skipped when:
 - Wi-Fi is not connected
 - Wi-Fi is in access-point mode
 
-Followup currently treats `ready` as:
+`ready` means a request can be issued right now:
 
 - `configured == true`
 - `authenticated == true`
 - Wi-Fi station connected (as last reported through `SetNetworkState`)
 
 Authentication is kept across a Wi-Fi drop, so `ready` returns on reconnect
-without re-validating the key. A change in `ready` caused by connectivity fires
-a Gemini event.
+without re-validating the key. A change in `ready` caused by connectivity fires a
+Gemini event, so the Gemini-connected cue also plays when Wi-Fi comes back.
+
+## Requests
+
+All requests go to `https://generativelanguage.googleapis.com/` with the
+`x-goog-api-key` header and TLS validated through the ESP-IDF CRT bundle. The
+model is fixed at `models/gemini-2.5-flash-lite`.
+
+| Operation | Calls |
+| --- | --- |
+| Authentication | `GET v1beta/<model>`. A 2xx marks the key valid and records the model display name. |
+| Text generation (`GenerateText`) | `POST v1beta/<model>:generateContent` with a single text part. Used by `summary_service`. |
+| Transcription (`Transcribe`) | Three requests: start a resumable upload (`POST /upload/v1beta/files`), stream and finalize the WAV to the returned upload URL, then `generateContent` referencing the uploaded file. The audio goes straight from the PSRAM clip chunks to the socket (header, then PCM), so there is no full copy of the clip in RAM. |
+| Clean-up (`DeleteUploadedFile`) | `DELETE v1beta/files/<id>` for the uploaded audio. |
+
+Generation requests send `temperature: 0` and `maxOutputTokens` (512 for
+transcription, 2048 for text). The transcription prompt asks for a verbatim
+transcript with no commentary or formatting.
+
+### Callers
+
+- `transcription_service` runs `Transcribe` on a short-lived worker task, publishes
+  the result, and only then deletes the uploaded file.
+- `summary_service` queues requests (depth 4) onto a persistent worker. It builds
+  a prompt from the last 3 days of transcripts, estimates its size locally, and
+  uses a chunked map-reduce when the estimate exceeds its input budget. Results
+  are cached on the SD card.
 
 ### Request serialization
 
-Every Gemini HTTPS exchange (authentication, `GenerateText`, and the
-three-session `Transcribe`) runs under one internal mutex. Each exchange opens
-its own TLS session, which costs tens of KB of internal RAM, so overlapping
-transcription, summary, and auth work is not allowed. A call can therefore block
-while another finishes. The lock order is network mutex first, state mutex
-second.
+Every Gemini HTTPS exchange (authentication, `GenerateText`, `Transcribe`, and the
+file delete) runs under one internal mutex. Each exchange opens its own TLS
+session, which costs tens of KB of internal RAM, so overlapping transcription,
+summary, and auth work is not allowed. A call can therefore block while another
+finishes. The lock order is network mutex first, state mutex second.
 
 ### Key rejection
 
@@ -149,27 +170,26 @@ changed while the request was in flight.
 
 Authentication, `GenerateText`, and each step of `Transcribe` retry transient
 failures: connection-level `transport_error`, and HTTP 408, 429, 500, 502, 503,
-504. There are at most 3 attempts per operation, with a 1 s then 2 s backoff
-plus 0-499 ms of random jitter. Retries are skipped when Wi-Fi is down, and
-other statuses (400, 401, 403, 404, ...) and `response_too_large` are never
-retried. Backoff sleeps while holding the network lock, so it delays other
-Gemini work by a few seconds at most.
+504. There are at most 3 attempts per operation, with a 1 s then 2 s backoff plus
+0-499 ms of random jitter. Retries are skipped when Wi-Fi is down, and other
+statuses (400, 401, 403, 404, ...) and `response_too_large` are never retried.
+Backoff sleeps while holding the network lock, so it delays other Gemini work by a
+few seconds at most.
 
 For transcription, the audio upload (start + finalize) is retried as a unit on a
 fresh connection, because a failed resumable upload is not resumed. The
-`generateContent` step is retried on its own, so a failure there does not
-re-send the audio.
+`generateContent` step is retried on its own, so a failure there does not re-send
+the audio.
 
 ### Connection reuse during transcription
 
-The three transcription requests (start upload, send audio, `generateContent`)
-share one TLS connection through `HttpSession`. This was written against the
-ESP-IDF v5.4 `esp_http_client` source:
+The three transcription requests share one TLS connection through `HttpSession`.
+This was written against the ESP-IDF v5.4 `esp_http_client` source:
 
 - Every request on the session uses `esp_http_client_open` / `write` /
-  `fetch_headers` / `read`, never `esp_http_client_perform`. After the manual
-  flow the client is left in its "reading response" state, where `perform()`
-  would not send a new request but `open()` does.
+  `fetch_headers` / `read`, never `esp_http_client_perform`. After the manual flow
+  the client is left in its "reading response" state, where `perform()` would not
+  send a new request but `open()` does.
 - The client's event handler is the only thing that collects the response body
   (and the `x-goog-upload-url` header). It fires in the manual flow too, so the
   read loop only drains the socket; appending from both would duplicate data.
@@ -180,58 +200,37 @@ ESP-IDF v5.4 `esp_http_client` source:
 
 ### Uploaded audio cleanup
 
-`Transcribe` uploads the clip through the Files API and returns the file's
-resource name in `TranscriptionResult::uploaded_file_name` (only if it matches
-the expected `files/<id>` shape, since it is spliced into a URL). After
-`transcription_service` has published the result, it calls
-`gemini_service::DeleteUploadedFile(...)` to remove the file. The delete runs
-after the result so it adds nothing to the user-visible wait, goes through the
-same network lock as every other exchange, and is best effort: failures are
-logged and ignored because uploads expire on Google's side anyway.
+`Transcribe` returns the uploaded file's resource name in
+`TranscriptionResult::uploaded_file_name`, only if it matches the expected
+`files/<id>` shape (it is spliced into a URL). After `transcription_service` has
+published the result, it calls `gemini_service::DeleteUploadedFile(...)`. The
+delete runs after the result so it adds nothing to the user-visible wait, and it is
+best effort: failures are logged and ignored because uploads expire on Google's
+side anyway.
 
 ### Response and output limits
 
 Response bodies are capped while they are read: 16 KB for auth and the upload
-start/finalize calls, 64 KB for `generateContent`. A reply past the cap fails
-the request with `response_too_large` instead of growing the heap.
+start/finalize calls, 64 KB for `generateContent`. A reply past the cap fails the
+request with `response_too_large` instead of growing the heap.
 
-Requests also send `generationConfig.maxOutputTokens`: 512 for transcription
-and 2048 for text/summary generation. If the model stops at that ceiling, the
-service logs a warning and still returns the (possibly cut-off) text.
+If the model stops at its `maxOutputTokens` ceiling, the service logs a warning
+and still returns the (possibly cut-off) text.
 
 ### Token budgeting
 
-`summary_service` estimates prompt size locally (about 4 characters per token)
-to decide whether to trim or chunk. There is no `countTokens` call.
-
-## Transport Details
-
-The current auth path is intentionally minimal:
-
-- request type: HTTP `GET`
-- endpoint: `v1beta/<model>`
-- default model: `models/gemini-2.5-flash-lite`
-- auth header: `x-goog-api-key: <api_key>`
-
-The current implementation uses ESP-IDF's `esp_http_client` with the CRT bundle
-for TLS validation.
-
-Followup does not yet implement:
-
-- Gemini file upload
-- transcription prompts
-- text generation
-- token counting
+`summary_service` estimates prompt size locally (about 4 characters per token) to
+decide whether to trim or chunk. There is no `countTokens` call.
 
 ## Public C++ Snapshot Shapes
 
 Source of truth:
 
-- [`components/gemini_service/include/gemini_service.h`](/Users/tieuvong/Development/folloup-sticky/components/gemini_service/include/gemini_service.h)
+- [`components/gemini_service/include/gemini_service.h`](../components/gemini_service/include/gemini_service.h)
 
 ### `gemini_service::SettingsSnapshot`
 
-Current fields:
+Fields:
 
 - `configured`
 - `has_stored_api_key`
@@ -242,7 +241,7 @@ Current fields:
 
 ### `gemini_service::RuntimeSnapshot`
 
-Current fields:
+Fields:
 
 - `initialized`
 - `ready`
@@ -258,8 +257,10 @@ Current fields:
 - `last_error_code`
 - `last_error_message`
 
-`supports_audio_understanding` and `supports_structured_output` currently remain
-`false` because This firmware has not yet ported those provider capabilities.
+`supports_audio_understanding` and `supports_structured_output` are hard-coded
+`false` and nothing consults them; audio transcription works regardless.
+`request_in_flight` covers the authentication task only, not `GenerateText` or
+`Transcribe`.
 
 ### `gemini_service::Snapshot`
 
@@ -270,14 +271,14 @@ Contains:
 
 ### `gemini_service::SettingsPatch`
 
-Current fields:
+Fields:
 
 - `has_api_key`
 - `api_key`
 
 ### `gemini_service::Result`
 
-Current fields:
+Fields:
 
 - `success`
 - `validation_error`
@@ -286,17 +287,27 @@ Current fields:
 - `error_code`
 - `message`
 
+### `gemini_service::TextResult` and `TranscriptionResult`
+
+Return values of the synchronous calls (run them from a worker task, never from a
+UI or input task). Both carry `success`, `http_status`, `error_code`, and
+`error_message`. `TextResult` adds `text`. `TranscriptionResult` adds
+`transcript`, `uploaded_file_name`, and timing and size fields
+(`clip_duration_ms`, `wav_bytes`, `upload_chunk_count`, `upload_elapsed_ms`,
+`total_elapsed_ms`).
+
 ## Backend Endpoints
 
-Current backend endpoints:
+Backend endpoints:
 
 - `GET /api/settings/gemini`
 - `PATCH /api/settings/gemini`
 - `POST /api/settings/gemini/reset`
 - `GET /api/runtime/gemini`
 
-These routes are registered through the existing Wi-Fi backend server. Gemini
-does not start its own HTTP server.
+These routes are registered through the existing Wi-Fi backend server. Gemini does
+not start its own HTTP server. The setup portal in `webserver/` uses them to save
+and clear the API key.
 
 Constraints:
 
@@ -308,7 +319,7 @@ Constraints:
 
 ### `PATCH /api/settings/gemini`
 
-Current request shape:
+Request shape:
 
 ```json
 {
@@ -316,7 +327,7 @@ Current request shape:
 }
 ```
 
-Current validation rules:
+Validation rules:
 
 - `api_key` must be present
 - `api_key` must be a non-empty string after trimming
@@ -330,7 +341,7 @@ Used by:
 - successful `PATCH /api/settings/gemini`
 - successful `POST /api/settings/gemini/reset`
 
-Current response shape:
+Response shape:
 
 ```json
 {
@@ -370,7 +381,7 @@ Notes:
 
 ### Error Responses
 
-Current error response shape:
+Error response shape:
 
 ```json
 {
@@ -381,7 +392,7 @@ Current error response shape:
 }
 ```
 
-Common current error codes:
+Common error codes:
 
 - `missing_api_key`
 - `invalid_api_key`
@@ -390,49 +401,45 @@ Common current error codes:
 - `not_configured`
 - `task_alloc_failed`
 - `task_start_failed`
+- `response_too_large`
 - provider error codes returned from Gemini HTTP error payloads when present
+  (for example `RESOURCE_EXHAUSTED`, which the UI surfaces as "Gemini quota
+  exceeded")
 
 ## UI Integration
 
-Followup currently uses Gemini readiness in two product-facing ways:
+Gemini readiness is used in two product-facing ways:
 
 - the status bar shows the star icon when Wi-Fi is connected and Gemini is
   authenticated
-- the feedback layer plays a dedicated Gemini-connected cue when readiness
-  transitions from false to true
+- the feedback layer plays a dedicated Gemini-connected cue when readiness goes
+  from false to true
 
-The current status-bar icon is the star asset already present in
-`project_assets`. This firmware is not yet using the broader upstream Gemini-specific
-page/UI flows.
+The status-bar icon is the star asset already present in `project_assets`.
+Transcription and summary results surface through their own pages and toasts (see
+`docs/app-architecture.md`).
 
 ## Logging
 
-Current logs cover:
+Logs cover:
 
 - service initialization
-- auth start
-- auth success
-- auth failure
+- auth start, success, and failure
 - stale auth result suppression
+- retry attempts, key rejection, response-cap hits, and `maxOutputTokens` warnings
+- uploaded-file delete results
 - backend route registration failures
 - NVS read/write/clear failures
 - app-facing Gemini event snapshots in `app_shell`
 
-These logs are intended to make bring-up and backend integration easier before
-the larger Gemini feature set is ported.
+## Not Implemented
 
-## Deferred Followup Features
-
-The upstream Followup Gemini stack is broader than this implementation.
-
-Not yet ported:
-
-- transcription jobs
-- summary generation
-- archived audio upload
-- provider worker queue shared across multiple Gemini job types
-- frontend portal UI for Gemini settings
-
-When those features are ported, this document should be expanded rather than
-replaced so it remains accurate for this firmware's actual runtime behavior at each
-stage.
+- **No queue for failed transcriptions.** If a transcription fails after its
+  retries, the recording stays on the SD card without a transcript until the user
+  re-runs it from the Details page. `summary_service` skips recordings that have no
+  transcript.
+- **No cancellation.** An in-flight request runs until it completes or times out.
+- **No model selection.** The model is a compile-time constant
+  (`kDefaultModelName`).
+- **No Gemini call for Vibe Check.** That page only re-runs transcription for idea
+  recordings.

@@ -7,9 +7,7 @@
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 
-// Waveshare has four momentary buttons, all active-low to GND. The mapping below
-// mirrors the `followup` esp-epaper board target, which is the proven configuration
-// for this hardware:
+// Waveshare has four momentary buttons, all active-low to GND. The mapping is:
 //
 //   ACTION (BOOT, GPIO0) -- record arm/start/stop, and primary activate. Also the
 //                           light-sleep wake button, alongside the AXP2101 IRQ.

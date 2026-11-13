@@ -27,7 +27,7 @@ namespace {
 constexpr const char* kTag = "StorageService";
 constexpr const char* kMountPoint = "/sdcard";
 constexpr const char* kProbePath = "/sdcard/SDPROBE.TXT";
-constexpr const char* kProbeText = "reTerminal Sticky SD probe\n";
+constexpr const char* kProbeText = "Followup SD probe\n";
 constexpr const char* kVolumeLabel = "FOLLOUP";
 constexpr size_t kAllocationUnitSize = 16 * 1024;
 constexpr size_t kMaxFiles = 5;
@@ -280,8 +280,9 @@ esp_err_t InitializeCardAtBootLocked(SdCard& card)
 
     s_mount_result = MountCardLocked(card);
     if (s_mount_result == ESP_OK) {
-        // This board behaves best when the inserted card stays mounted after
-        // entering SPI mode, rather than being torn back down before display init.
+        // Keep the card mounted after boot-time init. It is only unmounted
+        // deliberately: for a format, for USB mass-storage mode, or to recover
+        // after light sleep.
         ESP_LOGI(kTag, "Startup SD init completed; card remains mounted");
     }
     return s_mount_result;

@@ -1,24 +1,23 @@
 # Followup App Architecture
 
 This project is an ESP-IDF C++17 firmware application for the
-[Waveshare ESP32-S3-ePaper-3.97](https://docs.waveshare.com/ESP32-S3-ePaper-3.97).
-The board details are in `docs/waveshare-epaper-hardware-spec.md`.
+[Waveshare ESP32-S3-ePaper-3.97](https://docs.waveshare.com/ESP32-S3-ePaper-3.97),
+which is the only hardware target. Full board details (pin map, bus layout, power
+and audio notes) are in `docs/waveshare-epaper-hardware-spec.md`.
 
-The codebase began as a port targeting the Seeed reTerminal Sticky, and parts of
-this document still describe that lineage where the design rationale carried
-over. Where the two boards differ, this document describes the Waveshare
-hardware, which is the only target the firmware builds for today. The most
-significant differences:
+## Target Hardware
 
-| Area | reTerminal Sticky | Waveshare ESP32-S3-ePaper-3.97 |
-| --- | --- | --- |
-| Input | GT911 capacitive touch + buttons | Buttons only — no touch controller |
-| Microphone | PDM mic (`pdm_mic`, `microphone_service`) | ES8311 codec over I2S (`audio_hal`) |
-| Speaker | none | ES8311 + NS4150B amplifier |
-| Power | BQ27220 fuel gauge + discrete latch | AXP2101 PMIC (rails, charger, power key) |
-| RTC | PCF85063 | PCF85063 |
-| IMU | — | QMI8658 6-axis |
-| Display bus | SPI2 shared with SD | Dedicated SPI3, no bus sharing |
+| Area | Part |
+| --- | --- |
+| Module | ESP32-S3-WROOM-1-N16R8 (16 MB flash, 8 MB octal PSRAM) |
+| Display | 3.97" mono e-paper, 800 x 480, SSD1677, dedicated SPI3 bus |
+| Input | Three-way rocker (`UP` / `FN` / `DOWN`), `BOOT`, and the PMIC `PWR` key. No touch controller. |
+| Power | AXP2101 PMIC: rails, charger, battery telemetry, power key |
+| Audio | ES8311 codec (microphone in, speaker out) + NS4150B amplifier, I2S0 |
+| RTC | PCF85063 |
+| IMU | QMI8658 6-axis (used for motion wake) |
+| Storage | MicroSD over the 4-bit SDMMC controller |
+| Temperature / humidity | SHTC3 on the sensor I2C bus (present, not driven) |
 
 ## Current Scope
 
@@ -32,7 +31,9 @@ onboarding, and a set of feature pages plus overlays) built on:
 - A minimal C++ `app_main()`.
 - An `axp2101` component: the PMIC driver that owns the rails, charger, battery
   telemetry, and the power-key interrupt stream.
-- A ported PCF85063 RTC driver.
+- A `pcf85063` RTC driver.
+- An `i2c_device` helper for register access on the shared sensor I2C bus,
+  used by the I2C peripheral drivers.
 - A `qmi8658` component for the 6-axis IMU used by motion wake.
 - A `board` component (`waveshare_board`) that owns Waveshare-specific pin
   mapping, PMIC rail bring-up, the shared sensor I2C bus, and the audio codec
@@ -57,7 +58,7 @@ onboarding, and a set of feature pages plus overlays) built on:
   the many list/menu/input widgets) plus the full page renderers (dashboard,
   onboarding, vibe check, summarize, notes, todos, follow-up, details, settings,
   wifi, time).
-- A ported `sd_card` component for SDMMC/FATFS MicroSD access.
+- An `sd_card` component for SDMMC/FATFS MicroSD access.
 - A `storage_service` component that owns app-facing MicroSD mount, format, and
   debug status policy.
 - A `wifi_service` component that owns ESP-IDF Wi-Fi station/AP lifecycle,
@@ -79,28 +80,35 @@ onboarding, and a set of feature pages plus overlays) built on:
 - A `transcription_service` and a `summary_service` component that own the
   Gemini-backed transcription and summary flows respectively (these live in
   their own components, not inside `gemini_service`).
-- A ported mono SSD1677 e-paper panel driver. On this board the panel owns a
-  dedicated SPI3 bus, so there is no shared-bus serialization to do — the
-  Sticky's `shared_bus_service` has no counterpart here.
+- An `epaper_panel` component: the mono SSD1677 panel driver. The panel owns a
+  dedicated SPI3 bus (write-only, no MISO), so nothing arbitrates the bus.
 - A `display_service` component that owns app-facing e-paper bring-up, blank
   screen refresh, display sleep, and light-sleep recovery.
+- A `page_navigation` component with the reusable roving-focus and navigation
+  input primitives the pages share.
 - Staged e-paper asset generation scripts and source PNG/TTF assets for the
   app UI.
-
-- A ported QMI8658 6-axis inertial sensor driver.
 - An `imu_service` component that owns app-facing IMU bring-up and sample
   logging, used by motion-based wake.
 - A `device_sleep_service` component that owns auto-sleep policy state,
   inactivity timing, app-level blocker checks, and staged sleep events.
 - A `task_config` component that owns the app-created FreeRTOS task priority
   and core-affinity mapping.
-The board carries an SHTC3 temperature/humidity sensor on the shared sensor I2C
-bus. It is not driven by any component today.
 
-This board has no touch controller — input is entirely buttons. Some widget code
-still carries `kTouch*` hit-slop constants and a `kTouchContact` feedback cue
-inherited from the Sticky port; they are vestigial and nothing dispatches touch
-events.
+The SHTC3 temperature/humidity sensor shares the sensor I2C bus but no component
+drives it today.
+
+The board has no touch controller, so input is entirely buttons. A few leftovers
+from an earlier touch-capable design remain in the code and are inert: the
+`kTouch*` hit-slop constants in `design_tokens` / `carousel` / `global_footer`,
+the `kTouchContact` feedback cue, and the `kPriorityTouch` task-priority name
+(still used for the input dispatcher task). Nothing dispatches touch events.
+
+The repository also contains `webserver/`, the TypeScript + Vite setup portal
+(Wi-Fi, Gemini API key, time and timezone). Its built output is embedded into the
+firmware through `components/wifi_service/CMakeLists.txt` and served by
+`wifi_service` while the device is in access-point mode. See
+`webserver/README.md`.
 
 ## Project Layout
 
@@ -130,6 +138,10 @@ main/
   input_runtime_setup.cpp
   lock_screen_runtime.h
   lock_screen_runtime.cpp
+  power_key_runtime.h              # PMIC power-key press decoding (short = lock, long = shutdown)
+  power_key_runtime.cpp
+  clip_playback_runtime.h          # off-thread clip playback for the Details page / review step
+  clip_playback_runtime.cpp
   status_bar_runtime.h
   status_bar_runtime.cpp
   page_action_result.h
@@ -150,8 +162,6 @@ main/
   wifi_page_interactions.cpp
   time_page_interactions.h
   time_page_interactions.cpp
-  page_interaction_runtime.h
-  page_interaction_runtime.cpp
   timeline_format.h                # shared timeline date/time formatters ("Today" logic)
   timeline_format.cpp
   ui_refresh_runtime.h
@@ -190,8 +200,8 @@ components/
   transcription_service/
   wifi_service/
 partitions.csv
-sdkconfig
-sdkconfig.defaults
+sdkconfig.defaults          # `sdkconfig` is generated by the build and is not tracked
+webserver/                  # setup-portal front end, embedded into wifi_service
 docs/
   app-architecture.md
   asset-generation.md
@@ -240,11 +250,9 @@ Current scope:
 - a canonical four-step e-paper grayscale ramp (`gray1` through `gray4`) plus
   semantic grayscale color roles
 - typography roles, sizes, and weights
-- common component sizing constants used by the e-paper UI being ported
+- common component sizing constants used by the e-paper UI
 
-Use this component as the first dependency when porting small pieces from the
-old `epaper_lib`. Keep UI tokens independent from display hardware and
-framebuffer mechanics.
+Keep UI tokens independent from display hardware and framebuffer mechanics.
 
 ### `components/epaper_ui`
 
@@ -257,8 +265,11 @@ Current scope:
 
 - generated Inter bitmap fonts used by e-paper UI typography roles
 - a small role-aware bitmap font renderer
-- the app status-bar state contract and renderer
-- a reusable lock-screen renderer plus its dedicated state contract
+- the app status-bar and global-footer state contracts and renderers
+- the lock-screen renderer plus its dedicated state contract
+- overlay renderers (card modal, select modal, keyboard, toast, sticky note)
+- reusable list, menu, input, and layout widgets
+- the full-page renderers for every screen (see "Screens and overlays")
 
 App-owned runtime helpers in `main/` may compose service state into these UI
 contracts, but the drawing primitives themselves should stay reusable and
@@ -266,13 +277,13 @@ service-agnostic.
 
 ### UI Layering
 
-The e-paper UI stack is now intentionally split across three layers:
+The e-paper UI stack is intentionally split across three layers:
 
 - `design_tokens` owns product-wide spacing, grayscale, typography, and
   component metrics.
 - `epaper_ui` owns reusable presentation primitives such as bitmap fonts,
   role-aware text rendering, the status bar renderer, the lock-screen
-  renderer, and future view widgets ported from `followup`.
+  renderer, and the shared view widgets and page renderers.
 - app-owned runtime helpers in `main/` compose service state into UI contracts.
   Today that includes `status_bar_runtime`, which translates
   `power_service`, `wifi_service`, `timezone_service`, and sleep/shutdown state
@@ -386,78 +397,78 @@ The current app-runtime helpers under `main/` are:
 - `footer_runtime`: project footer layout and shared page focus into
   `epaper_ui::GlobalFooterState` (Settings/WiFi/Time/Folder/Sticky/Home + Mic)
 - `overlay_runtime`: own retained overlay state (card modal, select modal,
-  keyboard, toast, and the full-page sticky-note overlay), hit testing, and
-  overlay presentation hooks
+  keyboard, toast, and the full-page sticky-note overlay), their focus and
+  submit/dismiss behavior, and overlay presentation hooks
 - one runtime family per feature page — `{dashboard, onboarding, vibe_check,
   summarize, notes, todos, follow_up, details}_page_{runtime, coordinator,
   interactions}`, plus `settings/wifi/time` (runtime + interactions) — composing
   page state and translating focus into neutral page outcomes + follow-on intents
 - `timeline_format`: shared date/time formatters for the Notes/Todos/Follow-up
   timelines and the sticky-note overlay (the "Today"-vs-absolute-date logic)
-- `input_runtime_setup`: own app-facing button/touch binding setup plus the
-  shared inputs-enabled gate before events enter app routing
+- `input_runtime_setup`: own app-facing button binding setup plus the shared
+  inputs-enabled gate before events enter app routing
 - `input_focus_runtime`: own overlay-first button routing for roving focus
-  movement plus app-wide touch contact precedence
-- `page_input_runtime`: own active page input routing for the current
-  page-owned screens, including focus movement, page-local button activation,
-  footer projection hooks, touch-provider registration, and applying neutral
-  page interaction results into app-facing behavior
-- `settings_page_interactions` / `wifi_page_interactions` /
-  `time_page_interactions`: own page-local focus and activate semantics for the
-  current page-owned screens so the shared page-input layer applies
-  intent/results instead of open-coding page behavior inline inside each runtime
-- `page_interaction_runtime`: own the registration contract future page
-  runtimes/coordinators use to plug page targets into the shared touch
-  interaction path
+  movement
+- `page_input_runtime`: own active page input routing for the page-owned
+  screens, including focus movement, page-local button activation, footer
+  projection hooks, and applying neutral page interaction results into
+  app-facing behavior
+- the `*_page_interactions` helpers (one per page): own page-local focus and
+  activate semantics so the shared page-input layer applies intent/results
+  instead of open-coding page behavior inline inside each runtime
+- `power_key_runtime`: decode the AXP2101 power-key interrupts into short and
+  long presses and hand them to app policy
+- `clip_playback_runtime`: run clip playback on a short-lived worker task so the
+  Details page and the recording review step never block an input task
 - `lock_screen_runtime`: own lock-screen visibility and clock-state composition
 - `ui_refresh_runtime`: own the keyed latest-wins UI presentation worker, and
   enforce the global overlay refresh rule (see "Overlay refresh suppression")
 
 The current early startup sequence is:
 
-- Detects whether the running image is `ESP_OTA_IMG_PENDING_VERIFY`.
-- Marks the image valid with `esp_ota_mark_app_valid_cancel_rollback()`.
-- Brings up the AXP2101 rails before OTA validation.
-- Initializes `power_service`.
-- Logs one power/battery diagnostic snapshot.
-- Initializes `feedback_service` and requests the startup feedback.
-- Initializes `storage_service` and logs one MicroSD diagnostic snapshot.
-  On this board, when a card is present, storage must initialize before the
-  shared-bus display path so the card enters SPI mode first and remains mounted.
+`app_shell::Run()` performs these steps in order:
+
+- Brings up the AXP2101 rails (`power_service::EnablePowerHold()`), then
+  detects whether the running image is `ESP_OTA_IMG_PENDING_VERIFY` and marks it
+  valid with `esp_ota_mark_app_valid_cancel_rollback()`.
+- Initializes `power_service` and logs one power/battery diagnostic snapshot.
+- Initializes `feedback_service`.
+- Initializes `storage_service`, which mounts the MicroSD card over SDMMC and
+  logs one diagnostic snapshot. The card has its own controller, so there is no
+  ordering constraint between storage and display bring-up.
 - Initializes `display_service` and clears the e-paper panel to a blank screen.
 - Initializes `ui_refresh_runtime`, which owns the shared latest-wins UI
-  presentation worker.
-- Initializes `overlay_runtime`, which owns global modal/toast overlay state,
-  shutdown-confirm focus, and overlay presentation hooks.
-- Initializes `imu_service` and logs three direct IMU samples for bring-up.
-- Initializes `power_key_runtime`, attaching the PMIC power-key handler that
-  routes a short press to the lock screen and a long press to the shutdown
-  confirmation.
-- Starts the auto-sleep runtime, which wires `device_sleep_service`, polls IMU
-  samples for inactivity, owns the auto-sleep worker task, and handles display
-  sleep/light sleep actions.
+  presentation worker, then `lock_screen_runtime` and `overlay_runtime` (global
+  modal/toast overlay state, shutdown-confirm focus, and presentation hooks).
+- Configures `input_runtime_setup` (button handler and the inputs-enabled gate)
+  and plays the startup feedback cue.
+- Initializes `imu_service`, then starts the auto-sleep runtime, which wires
+  `device_sleep_service`, polls IMU samples for inactivity, owns the auto-sleep
+  worker task, and handles display sleep/light sleep actions.
 - Initializes `timezone_service`, which loads timezone/time-sync state from
   NVS, applies the configured timezone, and seeds system time from the PCF85063
   RTC when available.
+- Initializes `recording_archive_service` (the SD recording index) and
+  `gemini_service`.
 - Initializes `wifi_service`, which loads saved Wi-Fi credentials or built-in
   sdkconfig credentials, starts station mode when credentials exist, or starts
-  AP setup mode when no credentials are available.
-- Initializes `recording_service` and logs recording status.
-- Initializes `recording_session_service`, which owns the press/hold recording
-  flow, tag selection, and transcription/save orchestration.
+  AP setup mode when no credentials are available. Wi-Fi events forward
+  connection state into `timezone_service` (so network time sync starts once
+  station connectivity is available) and `gemini_service` (which authenticates
+  once a network is up).
+- Initializes `recording_service`, `transcription_service`, and
+  `recording_session_service` (the press/hold recording flow, tag selection, and
+  transcription/save orchestration).
 - Initializes `footer_runtime`, which seeds the footer layout (Settings, WiFi,
   Time, Folder, Sticky, Home buttons — in that left-to-right order — plus the Mic
   status) and the footer focus projection model. The Sticky button (left of Home)
   opens the follow-up sticky-note overlay.
-- Initializes `button_service`.
-- Subscribes to button and touch events, forwards user activity into
-  auto-sleep, forwards interaction feedback into `feedback_service`, and handles
-  button-driven lock-screen, refresh, and shutdown intents.
-- Subscribes to Wi-Fi events and forwards connection state into
-  `timezone_service` so network time sync starts after station connectivity is
-  available.
-- Runs a small shutdown task so button callbacks can request shutdown without
-  directly executing the PMIC power-off sequence.
+- Starts a small shutdown task so callbacks can request shutdown without
+  directly executing the PMIC power-off sequence, then initializes
+  `power_key_runtime` (a short `PWR` press toggles the lock screen, a long press
+  opens the shutdown confirmation) and `button_service`. Button events forward
+  user activity into auto-sleep, interaction feedback into `feedback_service`,
+  and button-driven lock-screen, refresh, and shutdown intents into the app.
 - Seeds the status bar and footer state (no refresh), then renders the first
   screen with a single **full** refresh as the first thing the panel paints, and
   finally sets `s_startup_complete`. On first boot (NVS `app_state`/`onboarded`
@@ -505,33 +516,26 @@ Current app-level button interactions are:
 - Pressing and holding `BOOT` arms then starts the recording-session flow;
   releasing stops it. See [Recording Flow](#recording-flow) for what happens
   between the release and the tag menu.
-- while the select modal is visible, `UP` and `DOWN` press down plus gated
-  hold-repeat move roving focus with wraparound, a primary-button click submits the focused
-  item, and touch focuses the touched item on contact before submitting on
-  release.
-- while the shutdown modal is visible, `UP` and `DOWN` press down plus gated
-  hold-repeat move roving focus with wraparound, a primary-button click activates the
-  focused action, and touch focuses `Cancel` or `Shut down` on contact before
-  activating on release.
-- when no overlay captures input, footer targets participate in the same touch
-  model: touch-down focuses the footer item immediately and touch-up activates
-  the armed footer target. On page-owned screens, that touch-down focus is
-  translated straight into page-local focus truth before footer projection is
-  repainted.
+- While the select modal is visible, `UP` and `DOWN` press down plus gated
+  hold-repeat move roving focus with wraparound, and a primary-button click
+  submits the focused item.
+- While the shutdown modal is visible, `UP` and `DOWN` press down plus gated
+  hold-repeat move roving focus with wraparound, and a primary-button click
+  activates the focused action (`Cancel` or `Shut down`).
 
-Shutdown still runs through the deferred AppShell shutdown task so the
-PMIC power-off sequence does not execute inside the button callback. The
-shutdown chord now routes through the app-owned input/overlay path first, and
-only a confirmed modal action notifies the task. The task waits briefly before
-calling `power_service::RequestShutdown()` so the analog button/Q2 bootstrap
-path has time to stop feeding `PWR_EN`.
+Shutdown runs through a deferred shutdown task owned by `app_shell`, so the PMIC
+power-off sequence never executes inside a button or power-key callback. A long
+`PWR` press opens the confirmation modal, and only a confirmed modal action
+notifies the task. The task waits briefly for the power-key release to settle,
+then calls `power_service::RequestShutdown()`, which clears the PCF85063
+alarm/timer interrupt sources and calls `Axp2101::PowerOff()`.
 
 Current input precedence and focus ownership are:
 
-- overlay roving/hit focus first: card modal, select modal, keyboard, and the
-  full-page sticky-note overlay, plus the closable toast
+- overlay focus first: card modal, select modal, keyboard, and the full-page
+  sticky-note overlay, plus the closable toast
 - footer targets when no overlay captures input
-- registered page targets after footer under the shared page-touch contract
+- the active page's own targets after the footer
 
 Current focus-surface inventory is:
 
@@ -556,13 +560,13 @@ Ownership is intentionally split as:
   generation and hold-repeat gating for navigation buttons
 - `main/input_callback_dispatcher.*`: dedicated latest-wins input callback task
   for app-owned button routing
-- `main/input_runtime_setup.*`: app-owned raw button/touch binding setup plus a
+- `main/input_runtime_setup.*`: app-owned raw button binding setup plus a
   shared inputs-enabled gate before app routing begins
 - `main/button_input_runtime.*`: app-wide hardware-button dispatch policy that
   converts raw button events into shared navigation press/hold behavior before
   they reach page or overlay code
-- `main/input_focus_runtime.cpp`: app-owned focus routing, touch contact state,
-  and app-wide precedence for overlay, footer, and page targets
+- `main/input_focus_runtime.cpp`: app-owned focus routing and app-wide
+  precedence for overlay, footer, and page targets
 - `main/page_input_runtime.*`: active page input routing for current page-owned
   screens so `app_shell` and `input_focus_runtime` do not hard-code page
   behavior directly, and so neutral page interaction results are applied in
@@ -571,41 +575,24 @@ Ownership is intentionally split as:
   `main/time_page_interactions.*`: focused interaction helpers that translate
   current page focus into neutral page outcomes plus follow-on intents, while
   leaving service effects and orchestration callbacks outside the coordinator
-- `main/page_interaction_runtime.cpp`: registration point for future page
-  runtimes/coordinators to provide `resolve -> focus -> activate` touch hooks
 - `main/overlay_runtime.cpp`: retained overlay state, focus-sync, submit, and
   dismiss behavior for the card modal, select modal, keyboard, toast, and
   sticky-note overlays
 - `main/footer_runtime.cpp`: presentation-only projection of footer layout and
-  shared page focus into the e-paper footer contract, plus footer
-  touch resolve/focus/activate hooks for footer-owned surfaces such as `Home`
-- `main/app_shell.cpp`: orchestration only; wires button/touch events into the
+  shared page focus into the e-paper footer contract
+- `main/app_shell.cpp`: orchestration only; wires button events into the
   focused runtime helpers and composes higher-level product policy
 
-The current shared page-touch contract for current and future page-owned
-screens is:
-
-- `resolve_touch_target(x, y, target)`: identify whether a page-owned
-  interactive target was touched
-- `focus_touch_target(target)`: update page-owned focus truth immediately
-- `activate_touch_target(target)`: perform page-owned activation on touch
-  release
-
-This contract is implemented by every page-owned screen: `Dashboard` (home),
-`Onboarding`, `VibeCheck`, `Summarize`, `Notes`, `Todos`, `FollowUp`, `Details`,
-`Settings`, `WiFi`, and `Time`. Dispatch for the active screen is centralized in
-`main/page_input_runtime.cpp` (`resolve/focus/activate` and button handling per
-`ScreenId`).
-
-Future pages should keep page-local selected indexes as render projections of
-page-owned focus truth rather than inventing separate touch-only selection
-state. Composite page controls should plug into this same contract instead of
-adding a second touch interaction path.
+Every page-owned screen (`Dashboard`/home, `Onboarding`, `VibeCheck`,
+`Summarize`, `Notes`, `Todos`, `FollowUp`, `Details`, `Settings`, `WiFi`, and
+`Time`) handles input the same way, and dispatch for the active screen is
+centralized in `main/page_input_runtime.cpp` (button handling per `ScreenId`).
+Pages keep their selected indexes as render projections of page-owned focus
+truth.
 
 Page-owned screens also own footer focus truth whenever their footer buttons are
-part of the same navigation model. Touch-down on `Settings` or `WiFi` footer
-targets is translated into the page coordinator's focus index first, and the
-footer is then repainted as a projection of that page-local state. The footer
+part of the same navigation model: the page coordinator holds the focus index,
+and the footer is repainted as a projection of that page-local state. The footer
 runtime keeps standalone focus ownership only on footer-owned surfaces such as
 `Home`.
 
@@ -622,14 +609,6 @@ Shared button-navigation rules are:
   for the same button lane
 - page modules own `MoveFocus(...)`, activate semantics, and retained page-state
   construction only
-
-The current app-wide touch lifecycle is:
-
-- touch-down resolves the highest-precedence target and focuses it immediately
-- touch-move may retarget focus while the contact stays active
-- touch-up activates only the armed target from that contact
-- touch-up with no armed target cancels activation without inventing a second
-  selection state
 
 The current app-wide interaction feedback lifecycle is:
 
@@ -649,8 +628,8 @@ leaking into reusable runtime helpers or shared interaction contracts.
 
 ### Time configuration page
 
-The time configuration page is the first screen ported end-to-end through the
-full page pattern, and is the reference example for adding a page. It is reached
+The time configuration page is the reference example for adding a page: it goes
+end-to-end through the full page pattern. It is reached
 from the global footer `Time` button and is composed across five layers:
 
 - **View renderer** (`components/epaper_ui/time_page.*`): a stateless
@@ -669,8 +648,7 @@ from the global footer `Time` button and is composed across five layers:
   a neutral activate intent (open timezone modal, edit a numeric field, toggle
   AM/PM, save, or footer navigation) with no side effects.
 - **Runtime** (`main/time_page_runtime.*`): the mutex-guarded orchestrator —
-  focus movement, touch resolve/focus/activate, footer projection, the overlay
-  editors, and the save flow. State is pushed to `display_service` and refreshes
+  focus movement, footer projection, the overlay editors, and the save flow. State is pushed to `display_service` and refreshes
   are scheduled through `ui_refresh_runtime` (`SurfaceKey::kTimePage`).
 - **Integration**: `display_service` gains `ScreenId::kTime`, `SetTimePageState`,
   and an `ApplyTime` / `DrawTimeUnderlay` path; `page_navigation` gains the
@@ -698,8 +676,8 @@ The save / sync flow:
 - `ApplySettingsPatch` never runs the blocking SNTP path on the caller's task.
   When the network is up it queues the NTP sync on the dedicated `timezone_sync`
   worker (`QueueSync`); the result returns asynchronously via the SNTP callback
-  -> `Notify` -> event. Running SNTP inline overflowed the small touch-task
-  stack.
+  -> `Notify` -> event. Running SNTP inline overflowed the small stack of the
+  calling task.
 - The clock also re-syncs on every Wi-Fi reconnect: `SetNetworkConnected` queues
   a sync on the disconnected -> connected transition whenever the clock is
   enabled and a timezone is set (default Eastern). The transition guard keeps
@@ -761,9 +739,9 @@ around a simple split:
 - CPU0 is the system/network side. ESP-IDF already runs the main task,
   `esp_timer`, and Wi-Fi driver work there in the current `sdkconfig`, so app
   Wi-Fi/time coordination stays close to that side.
-- CPU1 is the product hardware/UI side. Touch, audio capture, storage work,
-  sound feedback, and sleep-driven display transitions are kept away from CPU0
-  as the app scales.
+- CPU1 is the product hardware/UI side. Input dispatch, audio capture, storage
+  work, sound feedback, and sleep-driven display transitions are kept away from
+  CPU0 as the app scales.
 
 On single-core builds, the shared task config maps the app core back to CPU0.
 
@@ -940,9 +918,9 @@ and are composed here.
 - NS4150B power-amp enable: `GPIO_NUM_39`
 - panel geometry: 800 x 480
 
-There is no power latch on this board and no shared SPI bus to arbitrate: the
-AXP2101 holds the rails, and the panel owns SPI3 outright. Both were significant
-sources of Sticky-era complexity that simply do not apply here.
+There is no discrete power latch and no shared SPI bus to arbitrate: the AXP2101
+holds the rails, and the panel owns SPI3 outright. The SD slot has no card-detect
+or power-enable line (see `components/storage_service`).
 
 `waveshare_board.h/.cpp` owns:
 
@@ -1039,9 +1017,8 @@ policy.
 
 ### `components/audio_hal`
 
-This is the ES8311 codec layer. It replaces the Sticky's PDM-input-only path:
-this board has both a microphone and a speaker (ES8311 plus an NS4150B power
-amp), so the codec is full duplex.
+This is the ES8311 codec layer. The board has both a microphone and a speaker
+(ES8311 plus an NS4150B power amp), so the codec is full duplex.
 
 Current scope:
 
@@ -1071,7 +1048,7 @@ stop cue and the review playback without them overlapping.
 
 ### `components/feedback_service`
 
-This C++ component owns app-facing haptic/audio feedback policy. It maps product
+This C++ component owns app-facing audio feedback policy. It maps product
 events onto sound cues without exposing codec details to
 `app_shell`.
 
@@ -1089,35 +1066,29 @@ call `feedback_service` directly. They should emit neutral app-owned feedback
 cues and let `app_shell` map those cues onto `feedback_service` events.
 
 `app_shell` may request feedback events for button single-click, button
-double-click, non-power long-press-start, lock, unlock, touch contact, modal
-open, startup, shutdown, and other product-level interaction outcomes. It
-should not know about LEDC timer numbers, PWM duty values, GPIO setup, or exact
-sound-cue catalog composition.
+double-click, non-power long-press-start, lock, unlock, modal open, startup,
+shutdown, and other product-level interaction outcomes. It should not know about
+I2S setup, codec registers, or exact sound-cue catalog composition.
 
 ### `components/sd_card`
 
-This is the SDSPI/FATFS MicroSD wrapper ported from:
+This is the SDMMC/FATFS MicroSD wrapper. The Waveshare board wires the card to
+the ESP32-S3 SDMMC controller (slot 1, routed through the GPIO matrix) in 4-bit
+mode.
 
-```text
-/Users/tieuvong/Desktop/folloup/sticky_port/Device_Peripheral_Demo/components/sd_card
-```
+The component is board-agnostic. It receives an `SdCardPins` struct and mount
+point from its caller, then owns:
 
-The component is mostly board-agnostic. It receives an `SdCardPins` struct and
-mount point from its caller, then owns:
-
-- SD power-enable GPIO configuration
-- card-detect GPIO configuration
-- SDSPI bus/device setup, unless the caller marks the SPI bus as externally
-  owned
-- FATFS mount/unmount at the requested mount point
+- optional power-enable and card-detect GPIO configuration (both stay unbound on
+  this board, which has neither line)
+- SDMMC host and slot setup, and FATFS mount/unmount at the requested mount point
+- format and volume-label support
 - storage statistics
 - directory listing
 - small file read/write/append/truncate helpers
 
 Do not make this component depend on `board`; pass pins in from the service or
-board layer. On Sticky, `storage_service` asks the board layer to initialize the
-shared SPI bus first and passes `external_spi_bus=true`, so the SD wrapper only
-adds its SDSPI device to the existing bus.
+board layer (`storage_service` does this from `waveshare_board_config.h`).
 
 ### `components/storage_service`
 
@@ -1126,10 +1097,16 @@ the `sd_card` wrapper and owns app SD-card mount and format state.
 
 Current scope:
 
-- use the schematic page 5 MicroSD pin map
-- check `SD_DETECT`
-- mount `/sdcard` during boot when a card is present
+- build the SDMMC pin set from the board's `WAVESHARE_SD_*` pins. The slot has no
+  card-detect line, so an absent card shows up as a failed mount rather than a
+  detect-pin read
+- mount `/sdcard` during boot
 - keep the card mounted during normal runtime after successful boot-time init
+- re-initialize the card after light sleep (`RecoverAfterLightSleep()`): the SDMMC
+  card loses its state across a sleep cycle, so the cached mount handle is stale
+  on wake and the first read would time out. This forces a clean unmount and
+  remount
+- offer USB mass-storage mode (see below)
 - format the SD card on request, set the `FOLLOUP` volume label, and recreate
   the source-app directory layout:
   `/recordings`, `/todos`, `/summaries`, `/files`, `/trash`,
@@ -1144,28 +1121,25 @@ Current scope:
 An absent SD card is not a fatal app startup error. Mount failures are logged
 and returned to AppShell as non-fatal service initialization failures.
 
-MicroSD shares SPI lines with the e-paper path:
+The SD card uses the SDMMC controller and the panel owns SPI3, so the two never
+share a bus: there is nothing to arbitrate and no ordering requirement between
+mounting SD and bringing up the display. Format and other SD work therefore do
+not contend with panel refreshes at the bus level.
 
-- `SD_CLK/SCK` / `EP_SCK`: `GPIO13`
-- `SD_CMD/MOSI` / `EP_SDI`: `GPIO14`
-- `SD_D0/MISO`: `GPIO12`
-On this board the SD card uses the SDMMC controller and the panel owns SPI3, so
-there is no shared bus to arbitrate and no bus guard to acquire. The Sticky's
-shared-SPI ordering rules do not apply here.
+The product still keeps format feedback quiet: the formatting overlay is shown
+once when format begins and the SD worker is left undisturbed until the success
+or error modal appears at the end. Do not add intermediate format-progress
+overlay refreshes without a hardware-validated need, since each one is an extra
+panel refresh for no real information.
 
-During runtime SD format on Sticky, the storage path should minimize shared-SPI
-display activity. The current product policy is to show the formatting overlay
-once when format begins and then leave the SD worker undisturbed until the
-success or error modal is shown at the end. Do not reintroduce intermediate
-format-progress overlay refreshes unless a hardware-validated need outweighs
-the added bus contention risk.
-
-Hardware validation on Sticky showed an extra board-specific constraint: when an
-SD card is inserted, the card must be initialized on the shared SPI bus before
-the e-paper panel starts using that bus, and the card should remain mounted
-afterward. Tearing the card back down after boot caused the panel to log a
-refresh without visibly updating the screen. Treat "SD first, then display, and
-keep SD mounted" as a required startup policy on this hardware revision.
+**USB mass-storage mode ("OTG").** `storage_service` can hand the card to a USB
+host through TinyUSB MSC. `RequestEnterUsbMode()` unmounts the card app-side and
+exposes it to the host; `RequestExitUsbMode()` tears USB down and remounts. Enter
+is refused unless the card is mounted and idle, and when no USB cable is attached
+(there is no host to hand it to). While in USB mode the app has no filesystem at
+all, so there is no recording and no archive reads. Progress is reported through
+the normal storage event/snapshot path (`Mode::kEnteringUsbMode`, `kUsbMounted`,
+`kExitingUsbMode`).
 
 ### `components/playback_service`
 
@@ -1212,11 +1186,8 @@ status on top of this service rather than pushing those policies down into
 
 ### `components/epaper_panel`
 
-This is the raw mono SSD1677 e-paper panel driver ported from:
-
-```text
-/Users/tieuvong/Development/followup/components/board_drivers/epaper_panel
-```
+This is the raw mono SSD1677 e-paper panel driver (the 3.97" 800 x 480 panel on
+the Waveshare board).
 
 The driver should stay board-agnostic. It receives an `EpaperPanelConfig` from
 its caller and owns:
@@ -1232,7 +1203,7 @@ its caller and owns:
 - panel sleep
 - refresh timing metrics
 
-Current scope is intentionally mono-only. Do not port gray4 support unless a
+Current scope is intentionally mono-only. Do not add gray4 support unless a
 future product requirement explicitly asks for it.
 
 The first display update must use `RefreshFullBase()` so the SSD1677 current
@@ -1261,11 +1232,10 @@ The driver can initialize its own SPI bus, which is what this board does: the
 panel is given `external_spi_bus=false` and manages `SPI3_HOST` itself, write-only
 with no MISO.
 
-Not yet ported from Folloup:
+Not implemented:
 
-- wake API and display wake policy
-- fast refresh/base path
-- logical-to-raw display view abstraction
+- a fast refresh/base path
+- a logical-to-raw display view abstraction
 
 (A retained view dirty-region / windowed partial-refresh policy is intentionally **not**
 pursued: the SSD1677 panel cannot drive a sub-window, so region partial refresh is not
@@ -1363,24 +1333,19 @@ The current focus path is:
   re-rendered until the overlay closes
 - page-entry transitions still stay synchronous in `app_shell` rather than
   going through the latest-wins queue, because the app shell must preserve
-  deterministic ordering for touch-provider setup, footer layout, runtime state
-  sync, and screen switch
+  deterministic ordering for focus reset, footer layout, runtime state sync, and
+  screen switch
 
 The temporary demo-selection machinery has been removed; `display_service` owns a
 `ScreenId`-based screen model. The home screen renders the real dashboard
 (`DrawHomeUnderlay` → `epaper_ui::DrawDashboardPage`), whose focusable menu opens
 the feature pages.
 
-Because the SSD1677 path shares `SPI2_HOST` with MicroSD, `display_service`
-depends on `storage_service` having already performed SD bring-up when a card is
-inserted. The display path should not reorder itself ahead of storage during
-boot on this board.
-
 `display_service` owns app-facing display policy. Driver-specific wiring and
 SSD1677 commands must stay out of `main`. Raw board pin ownership stays in
 `board`, and low-level SSD1677 command sequencing stays in `epaper_panel`.
 
-Port validation notes still pending on hardware:
+Things to check on hardware after display-path changes:
 
 - rapid select-modal roving should continue to log
   `policy=reuse_underlay_snapshot` and must not leave stale highlight pixels
@@ -1389,10 +1354,7 @@ Port validation notes still pending on hardware:
   transcribing states
 - overlay behavior should remain correct across display sleep and light-sleep
   wake
-- touch-down focus should be visible before release-based activation for select
-  modal rows, shutdown buttons, and footer items
-- overlay, footer, and future page precedence logs should match the touched
-  surface during on-device validation
+- overlay and footer precedence in the input logs should match what is on screen
 
 ### `components/qmi8658`
 
@@ -1423,8 +1385,9 @@ interrupt line to coordinate.
 
 ## Hardware Notes
 
-- Main controller: `ESP32-S3R8`, dual-core Xtensa LX7 up to 240 MHz.
-- External flash: 16 MB. PSRAM: 8 MB.
+- Module: ESP32-S3-WROOM-1-N16R8 (ESP32-S3R8 SoC, dual-core Xtensa LX7 up to
+  240 MHz).
+- Flash: 16 MB (QIO, 80 MHz). PSRAM: 8 MB octal (80 MHz).
 - Shared sensor I2C on `GPIO41` (SDA) / `GPIO42` (SCL), carrying:
   - AXP2101 PMIC at `0x34`, interrupt on `GPIO38`
   - PCF85063 RTC at `0x51`
@@ -1447,9 +1410,9 @@ interrupt line to coordinate.
   MISO: `BUSY` on `GPIO3`, `DC` on `GPIO9`, `CS` on `GPIO10`, `SCK` on `GPIO11`,
   `MOSI` on `GPIO12`, `RST` on `GPIO46`. The panel is fed by the AXP2101 rails,
   so there is no GPIO power-enable.
-- Because the panel does not share a bus with MicroSD, none of the Sticky's
-  shared-SPI serialization applies here: there is no bus guard, and no ordering
-  requirement between mounting SD and bringing up the display.
+- Because the panel and MicroSD are on separate controllers (SPI3 and SDMMC),
+  nothing serializes access between them, and there is no ordering requirement
+  between mounting SD and bringing up the display.
 - The e-paper panel is 800 x 480 raw landscape pixels. `display_service` draws
   portrait content by mapping logical 480 x 800 coordinates into the raw
   framebuffer. Note that portrait `x` maps onto the panel's gate line
@@ -1465,8 +1428,11 @@ interrupt line to coordinate.
 
 Configuration is file-based and should stay reproducible:
 
-- `sdkconfig.defaults` captures the intended project defaults.
-- `sdkconfig` captures the resolved ESP-IDF configuration.
+- `sdkconfig.defaults` captures the intended project defaults (16 MB QIO flash,
+  octal PSRAM, OTA rollback, TinyUSB MSC for the SD storage mode, and the
+  `Folloup Settings` options).
+- `sdkconfig` is the resolved ESP-IDF configuration. The build generates it and it
+  is not tracked, so change defaults in `sdkconfig.defaults`, not in `sdkconfig`.
 - `partitions.csv` defines the OTA partition table.
 
 Project-specific Kconfig options live under `Folloup Settings`. Auto-sleep
@@ -1474,13 +1440,15 @@ currently exposes reproducible build-time defaults for display sleep and light
 sleep timeout seconds; `0` disables the corresponding stage, and a nonzero light
 sleep timeout must be greater than or equal to the display sleep timeout.
 
-The partition table currently contains:
+The partition table fills the 16 MB flash and currently contains:
 
-- `nvs`
+- `nvs` (24 KB)
 - `otadata`
 - `phy_init`
-- `ota_0`
-- `ota_1`
+- `ota_0` and `ota_1`, 0x7F0000 bytes each (about 8 MB), so the second slot ends
+  exactly at the 16 MB boundary
+
+There is no factory app, SPIFFS, or coredump partition.
 
 Rollback is enabled with `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. Because
 rollback is enabled, the application must keep the OTA validation hook in
